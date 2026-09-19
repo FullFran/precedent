@@ -1,9 +1,40 @@
 # precedent
 
+[![CI](https://github.com/FullFran/precedent/actions/workflows/ci.yml/badge.svg)](https://github.com/FullFran/precedent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 `precedent` is a corpus of markdown pages, plus a `PreToolUse` hook that reads
 one of them into the model's context before an `Edit`, `Write` or `Bash` call
 that matches it. It exists so a failure class you already wrote down gets
 read *before* the work that would repeat it, not after.
+
+## What it looks like
+
+You write a page once, and give it the paths or commands it is about:
+
+```markdown
+# A gate that cannot fail
+
+**Trigger paths:** `.github/workflows/**` `**/Makefile`
+```
+
+Months later, the agent is about to edit `.github/workflows/ci.yml`. Before the
+write happens, the hook answers:
+
+```json
+{"hookSpecificOutput":{"hookEventName":"PreToolUse",
+ "additionalContext":"# A gate that cannot fail\n\n**Trigger:** you are adding..."}}
+```
+
+The model reads the page, then makes the edit. On a path no page is about, the
+hook prints nothing and costs nothing.
+
+## Requirements
+
+- Python 3.8+ (standard library only, no packages to install)
+- Claude Code, or OpenCode with the adapter in `plugin/opencode/`
+
+There is no binary to build and nothing to put on your `PATH`.
 
 ## The problem
 

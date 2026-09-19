@@ -2,25 +2,27 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.12"]
+        # The README claims a minimum Python version. This matrix is what
+        # makes that claim true rather than asserted: the code is stdlib-only
+        # and deliberately free of syntax newer than the floor, and this is
+        # where that stays honest.
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Compile check
-        run: python3 -m py_compile plugin/claude-code/scripts/tripwire.py tools/mine.py
-
-      - name: Run tests
-        run: python3 -m unittest discover tests
+      - name: Compile
+        run: python -m py_compile plugin/claude-code/scripts/tripwire.py tools/mine.py
+      - name: Test
+        run: python -m unittest discover tests
