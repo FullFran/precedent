@@ -40,12 +40,24 @@ script.
 1. In Claude Code, add this repository as a plugin marketplace source, then
    install the `precedent` plugin from it:
    ```
-   /plugin marketplace add /path/to/this/repo
+   /plugin marketplace add FullFran/precedent
    /plugin install precedent@precedent
    ```
-   (If the plugin doesn't show as active immediately, run `/reload-plugins`.)
-2. Set `PRECEDENT_PATTERNS` to wherever you want to keep your corpus (or
-   just run `--init` below and use the default).
+   A local checkout works too, which is what you want while writing pages:
+   `/plugin marketplace add /path/to/this/repo`. Either way, if the plugin
+   does not show as active immediately, run `/reload-plugins`.
+
+   The plugin adds no tools and no always-on tokens. It is a hook, not an MCP
+   server, and Claude Code reports it as `harness-only — no model context
+   cost`.
+2. Point it at a corpus. The default is `~/.precedent/patterns`, so a symlink
+   is enough if you already keep your pages in a repository of your own:
+   ```
+   ln -s /path/to/your/corpus ~/.precedent/patterns
+   ```
+   Otherwise set `PRECEDENT_PATTERNS`, or just run `--init` below and use the
+   default. Run `--check` afterwards: if it lists no pages, the hook will run,
+   exit 0 and do nothing, which looks exactly like having nothing to say.
 
 The corpus deliberately does **not** ship inside the plugin: a marketplace
 install copies only `plugin/claude-code/`, and your patterns are your own
