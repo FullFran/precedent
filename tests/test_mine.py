@@ -3,7 +3,10 @@
 Run with: python3 -m unittest discover tests
 """
 
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 import importlib.util
@@ -68,6 +71,43 @@ def make_fixture_db(path, rows):
     )
     con.commit()
     con.close()
+
+
+def run_mine_subprocess(args):
+    """Invoke tools/mine.py as a real subprocess."""
+    return subprocess.run(
+        [sys.executable, str(SCRIPT_PATH)] + args,
+        input="",
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=dict(os.environ),
+    )
+
+
+# Two lessons worded alike, in two different projects: one candidate group,
+# observation ids 1 and 2. The ledger fixtures below reject exactly that
+# id set.
+LEDGER_FIXTURE_ROWS = [
+    (
+        1,
+        "bugfix",
+        "t1",
+        "**What**: x\n**Learned**: credentials leaked through an unset auth env variable\n",
+        "repo-a",
+        "2026-07-21 10:00:00",
+        None,
+    ),
+    (
+        2,
+        "bugfix",
+        "t2",
+        "**What**: x\n**Learned**: credentials leaked through an unset auth env variable path\n",
+        "repo-b",
+        "2026-08-28 10:00:00",
+        None,
+    ),
+]
 
 
 def make_lessons(rows):
@@ -173,7 +213,7 @@ class TestRanking(unittest.TestCase):
 
     def test_two_project_group_ranks_above_larger_one_project_group(self):
         lessons = make_lessons(self.ROWS)
-        groups = mine.assemble_groups(lessons, 0.25, 1)
+        groups, _suppressed = mine.assemble_groups(lessons, 0.25, 1)
         self.assertGreaterEqual(len(groups), 2)
         self.assertEqual(len(groups[0]["projects"]), 2)
         self.assertEqual(len(groups[0]["members"]), 2)
@@ -182,7 +222,7 @@ class TestRanking(unittest.TestCase):
 
     def test_min_projects_filters_out_single_project_groups(self):
         lessons = make_lessons(self.ROWS)
-        groups = mine.assemble_groups(lessons, 0.25, 2)
+        groups, _suppressed = mine.assemble_groups(lessons, 0.25, 2)
         self.assertEqual(len(groups), 1)
         self.assertEqual(len(groups[0]["projects"]), 2)
 
@@ -194,7 +234,7 @@ class TestDraft(unittest.TestCase):
             (2, "repo-b", "2026-08-28", "t2", "credentials leaked through an unset auth env variable path"),
         ]
         lessons = make_lessons(rows)
-        groups = mine.assemble_groups(lessons, 0.25, 2)
+        groups, _suppressed = mine.assemble_groups(lessons, 0.25, 2)
         self.assertEqual(len(groups), 1)
 
         draft = mine.render_draft(groups[0])
@@ -214,8 +254,238 @@ class TestDraft(unittest.TestCase):
         lessons = make_lessons(
             [(1, "repo-a", "2026-07-21", "t1", "one lonely lesson about nothing shared")]
         )
-        groups = mine.assemble_groups(lessons, 0.25, 2)
+        groups, _suppressed = mine.assemble_groups(lessons, 0.25, 2)
         self.assertIsNone(mine.find_group(groups, 999))
+
+
+class TestLedgerParsing(unittest.TestCase):
+    def test_parses_the_documented_format(self):
+        entries, malformed = mine.parse_ledger(mine.LEDGER_FORMAT)
+        self.assertEqual(malformed, [])
+        self.assertEqual([e.decision for e in entries], ["rejected", "admitted", "retired"])
+        self.assertEqual(entries[0].obs_ids, frozenset({6570, 7523}))
+        self.assertEqual(entries[1].obs_ids, frozenset({101, 102}))
+        self.assertEqual(entries[2].obs_ids, frozenset())
+        self.assertEqual(entries[0].date, "2026-09-19")
+        self.assertIn("generic word", entries[0].note)
+
+    def test_prose_and_blank_lines_are_not_malformed(self):
+        text = (
+            "# Decisions\n"
+            "\n"
+            "Everything below is append-only.\n"
+            "\n"
+            "- 2026-09-19 | rejected | miner group | obs: 1,2 | unrelated\n"
+        )
+        entries, malformed = mine.parse_ledger(text)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(malformed, [])
+
+    def test_malformed_lines_are_reported_with_a_reason(self):
+        text = (
+            "- 2026-09-19 | rejected | miner group | obs: 1,2 | fine\n"
+            "- not-a-date | rejected | g | obs: 3 | bad date\n"
+            "- 2026-09-19 | rejcted | g | obs: 4 | typo in the decision\n"
+            "- 2026-09-19 | rejected | g | 5,6 | no obs: prefix\n"
+            "- 2026-09-19 | rejected | g | obs: seven | not an id\n"
+            "- 2026-09-19 | rejected | too few fields\n"
+        )
+        entries, malformed = mine.parse_ledger(text)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual([lineno for lineno, _raw, _why in malformed], [2, 3, 4, 5, 6])
+        reasons = " ".join(why for _l, _r, why in malformed)
+        self.assertIn("YYYY-MM-DD", reasons)
+        self.assertIn("rejcted", reasons)  # the typo is named, not swallowed
+        self.assertIn("obs:", reasons)
+
+    def test_only_rejected_entries_with_ids_suppress(self):
+        entries, _malformed = mine.parse_ledger(mine.LEDGER_FORMAT)
+        rejected = mine.rejected_obs_sets(entries)
+        # The admitted and retired lines are read, but they are not
+        # suppression: only the rejected one keys anything.
+        self.assertEqual(list(rejected), [frozenset({6570, 7523})])
+
+    def test_id_less_rejection_keys_nothing(self):
+        entries, _malformed = mine.parse_ledger(
+            "- 2026-09-19 | rejected | g | obs: - | no ids at all\n"
+        )
+        self.assertEqual(mine.rejected_obs_sets(entries), {})
+
+
+class TestLedgerSuppression(unittest.TestCase):
+    ROWS = [
+        (1, "repo-a", "2026-07-21", "t1", "credentials leaked through an unset auth env variable"),
+        (2, "repo-b", "2026-08-28", "t2", "credentials leaked through an unset auth env variable path"),
+    ]
+
+    def _rejected(self, text):
+        entries, _malformed = mine.parse_ledger(text)
+        return mine.rejected_obs_sets(entries)
+
+    def test_group_with_a_rejected_id_set_is_suppressed(self):
+        lessons = make_lessons(self.ROWS)
+        rejected = self._rejected(
+            "- 2026-09-19 | rejected | miner group | obs: 1,2 | unrelated documents\n"
+        )
+        groups, suppressed = mine.assemble_groups(lessons, 0.25, 2, rejected)
+        self.assertEqual(groups, [])
+        self.assertEqual(len(suppressed), 1)
+        obs_ids, entry = suppressed[0]
+        self.assertEqual(obs_ids, frozenset({1, 2}))
+        self.assertEqual(entry.note, "unrelated documents")
+
+    def test_id_order_in_the_ledger_does_not_matter(self):
+        lessons = make_lessons(self.ROWS)
+        rejected = self._rejected(
+            "- 2026-09-19 | rejected | miner group | obs: 2, 1 | reversed and spaced\n"
+        )
+        groups, suppressed = mine.assemble_groups(lessons, 0.25, 2, rejected)
+        self.assertEqual(groups, [])
+        self.assertEqual(len(suppressed), 1)
+
+    def test_a_different_id_set_is_not_suppressed(self):
+        # Equality, not overlap: a group that gained or lost a member has
+        # not been ruled on, and must still be proposed.
+        lessons = make_lessons(self.ROWS)
+        rejected = self._rejected(
+            "- 2026-09-19 | rejected | miner group | obs: 1 | only one of them\n"
+        )
+        groups, suppressed = mine.assemble_groups(lessons, 0.25, 2, rejected)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(suppressed, [])
+
+    def test_admitted_entry_does_not_suppress(self):
+        lessons = make_lessons(self.ROWS)
+        rejected = self._rejected(
+            "- 2026-09-19 | admitted | a-page | obs: 1,2 | became a page\n"
+        )
+        groups, suppressed = mine.assemble_groups(lessons, 0.25, 2, rejected)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(suppressed, [])
+
+    def test_no_ledger_suppresses_nothing(self):
+        lessons = make_lessons(self.ROWS)
+        groups, suppressed = mine.assemble_groups(lessons, 0.25, 2)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(suppressed, [])
+
+    def test_report_names_the_count_the_ids_and_the_reason(self):
+        lessons = make_lessons(self.ROWS)
+        text = "- 2026-09-19 | rejected | miner group | obs: 1,2 | unrelated documents\n"
+        entries, malformed = mine.parse_ledger(text)
+        groups, suppressed = mine.assemble_groups(
+            lessons, 0.25, 2, mine.rejected_obs_sets(entries)
+        )
+        report = mine.format_ledger_report("decisions.md", entries, suppressed, malformed)
+        self.assertIn("decisions.md", report)
+        self.assertIn("1 group(s) suppressed", report)
+        self.assertIn("obs 1,2", report)
+        self.assertIn("unrelated documents", report)
+
+    def test_report_is_printed_even_when_nothing_was_suppressed(self):
+        entries, malformed = mine.parse_ledger(
+            "- 2026-09-19 | admitted | a-page | obs: 9 | nothing to suppress\n"
+        )
+        report = mine.format_ledger_report("decisions.md", entries, [], malformed)
+        self.assertIn("1 decision(s) read", report)
+        self.assertIn("0 group(s) suppressed", report)
+
+
+class TestDraftRecordsObservationIds(unittest.TestCase):
+    def test_draft_carries_a_ledger_line_with_its_obs_ids(self):
+        lessons = make_lessons(TestLedgerSuppression.ROWS)
+        groups, _suppressed = mine.assemble_groups(lessons, 0.25, 2)
+        draft = mine.render_draft(groups[0])
+        self.assertIn("obs: 1,2", draft)
+        self.assertIn("ledger line for this group", draft)
+
+
+class TestLedgerCli(unittest.TestCase):
+    """--ledger against a real fixture store, through the real CLI."""
+
+    def _db_and_ledger(self, tmp, ledger_text):
+        db_path = Path(tmp) / "fixture.db"
+        make_fixture_db(db_path, LEDGER_FIXTURE_ROWS)
+        ledger_path = Path(tmp) / "decisions.md"
+        ledger_path.write_text(ledger_text, encoding="utf-8")
+        return db_path, ledger_path
+
+    def test_run_without_ledger_reports_the_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ledger = self._db_and_ledger(tmp, "")
+            result = run_mine_subprocess(["--db", str(db_path), "--min-projects", "2"])
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("1 candidate group(s) met the thresholds", result.stdout)
+
+    def test_ledger_suppresses_the_group_and_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, ledger_path = self._db_and_ledger(
+                tmp,
+                "# Decisions\n"
+                "\n"
+                "- 2026-09-19 | rejected | miner group | obs: 1,2 | "
+                "shared one generic word; unrelated documents\n",
+            )
+            result = run_mine_subprocess(
+                ["--db", str(db_path), "--min-projects", "2", "--ledger", str(ledger_path)]
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("no candidate groups met the thresholds", result.stdout)
+        self.assertIn("1 group(s) suppressed", result.stdout)
+        self.assertIn("obs 1,2", result.stdout)
+        self.assertIn("unrelated documents", result.stdout)
+
+    def test_malformed_ledger_line_is_ignored_without_aborting_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, ledger_path = self._db_and_ledger(
+                tmp,
+                "- this line is not a ledger entry at all\n"
+                "- 2026-09-19 | rejcted | miner group | obs: 1,2 | typo in the decision\n",
+            )
+            result = run_mine_subprocess(
+                ["--db", str(db_path), "--min-projects", "2", "--ledger", str(ledger_path)]
+            )
+
+        self.assertEqual(result.returncode, 0)
+        # The typo'd decision suppressed nothing, and the run says so
+        # instead of quietly behaving as though the line were not there.
+        self.assertIn("1 candidate group(s) met the thresholds", result.stdout)
+        self.assertIn("0 group(s) suppressed", result.stdout)
+        self.assertIn("ignored malformed ledger line", result.stdout)
+        self.assertIn("rejcted", result.stdout)
+
+    def test_missing_ledger_file_is_an_error_not_a_silent_no_op(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ledger = self._db_and_ledger(tmp, "")
+            missing = Path(tmp) / "nope.md"
+            result = run_mine_subprocess(
+                ["--db", str(db_path), "--min-projects", "2", "--ledger", str(missing)]
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(missing), result.stderr)
+
+    def test_draft_honours_the_ledger_and_keeps_stdout_a_clean_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, ledger_path = self._db_and_ledger(
+                tmp, "- 2026-09-19 | admitted | a-page | obs: 9 | unrelated decision\n"
+            )
+            result = run_mine_subprocess(
+                [
+                    "--db", str(db_path),
+                    "--min-projects", "2",
+                    "--ledger", str(ledger_path),
+                    "--draft", "1",
+                ]
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(result.stdout.startswith("# TODO: name the class"))
+        self.assertIn("obs: 1,2", result.stdout)
+        # The ledger's own report goes to stderr, never into the page.
+        self.assertIn("decision(s) read", result.stderr)
+        self.assertNotIn("decision(s) read", result.stdout)
 
 
 class TestReadLessonsFromFixtureDb(unittest.TestCase):

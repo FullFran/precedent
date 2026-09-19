@@ -39,6 +39,20 @@ class name, the `## What goes wrong` explanation, the trigger globs, and the
 `## Check before you trust this` section are still yours to write. Mining
 proposes; you dispose.
 
+Write what the model should read *above* the page's `## Evidence` heading.
+Everything from that heading down stays on disk and is never injected (see
+[DOCS.md](DOCS.md#what-is-injected-the-head-not-the-page)) — the evidence is
+there so a human can check the page, not so the model can re-read it on
+every match.
+
+When you dispose, record it. The draft ends with the ledger line for its own
+observation ids; paste it into your ledger with the decision and the reason,
+and `mine.py --ledger <path>` will stop proposing a group you already
+rejected — and will say so out loud when it does. The format is in
+[DOCS.md](DOCS.md#the-decision-ledger). A page that stops being true does not
+have to be deleted either: a `**Retired:**` line keeps the evidence and stops
+the page firing.
+
 ## The one rule for code changes
 
 **Never make a path that can exit non-zero or block a tool call.**

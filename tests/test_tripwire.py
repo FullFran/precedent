@@ -228,6 +228,78 @@ Not a real pattern page, must be excluded.
 **Trigger paths:** `**/*.everything`
 """
 
+# A page shaped like a real one: a head the model acts on, then an Evidence
+# section (the majority of the bytes) that a human needed in order to admit
+# the page and that the model never acts on.
+EVIDENCE_PAGE = """# A gate that cannot fail
+
+**Trigger:** you are adding CI.
+
+**Trigger paths:** `.github/workflows/**` `**/Makefile`
+
+**Class:** the check reports success without having checked.
+
+## What goes wrong
+
+A gate is added, it goes green, and green is read as evidence. The gate
+never ran, or ran against nothing, or its exit status was swallowed.
+
+## Evidence
+
+    fix(ci): the workflow's test job matched no files and still exited 0
+    fix(release): the publish gate reported the exit status of tail, not
+                  of the command it was piping, so every release was green
+
+Both are quoted verbatim with their source, which is what makes them
+checkable, and also what makes them the longest part of this page. They
+are the reason a human admitted the page. They are not instructions, and
+nothing acts on them at the moment an edit is about to happen.
+
+## Check before you trust a gate
+
+- Make it fail on purpose, once, and watch it go red.
+"""
+
+# What actually gets injected: the page minus its Evidence section, with
+# everything after that section still in. Derived from the function under
+# test on purpose -- the point of these fixtures is the round trip through
+# the hook, and a second hand-rolled implementation of the rule here would
+# just be a second thing to keep in sync.
+EVIDENCE_PAGE_HEAD = tripwire.split_evidence(EVIDENCE_PAGE)[0]
+
+LOWERCASE_EVIDENCE_PAGE = """# Lowercased evidence heading
+
+**Trigger paths:** `**/lower.txt`
+
+Body above.
+
+### evidence (two occurrences)
+
+Quoted material below the heading.
+"""
+
+RETIRED_PAGE = """# A page that stopped being true
+
+**Trigger paths:** `.github/workflows/**` `**/Makefile`
+
+**Retired:** the runner that caused this was replaced in 2026-08; no
+occurrence since.
+
+## What goes wrong
+
+Kept on disk because the evidence is still worth reading.
+"""
+
+RETIRED_NO_REASON_PAGE = """# A page retired without saying why
+
+**Trigger paths:** `**/Makefile`
+
+**Retired:**
+"""
+
+RETIRED_NO_HEADING_PAGE = """**Retired:** no heading anywhere in this file.
+"""
+
 
 class TempCorpus:
     """Context manager building a temp patterns/ directory."""
@@ -382,40 +454,40 @@ class TestCommandGlobMatching(unittest.TestCase):
 
 class TestPageParsing(unittest.TestCase):
     def test_parses_title_and_path_globs(self):
-        title, path_globs, command_globs, reason = tripwire.parse_page(GATE_PAGE)
+        title, path_globs, command_globs, reason, retired = tripwire.parse_page(GATE_PAGE)
         self.assertEqual(title, "A gate that cannot fail")
         self.assertEqual(path_globs, [".github/workflows/**", "**/Makefile"])
         self.assertEqual(command_globs, [])
         self.assertIsNone(reason)
 
     def test_parses_title_and_command_globs(self):
-        title, path_globs, command_globs, reason = tripwire.parse_page(COMMAND_ONLY_PAGE)
+        title, path_globs, command_globs, reason, retired = tripwire.parse_page(COMMAND_ONLY_PAGE)
         self.assertEqual(title, "Backticks execute in a shell body")
         self.assertEqual(path_globs, [])
         self.assertEqual(command_globs, ["gh * --body*", "gh * --body-file*"])
         self.assertIsNone(reason)
 
     def test_parses_both_kinds_on_one_page(self):
-        title, path_globs, command_globs, reason = tripwire.parse_page(BOTH_KINDS_PAGE)
+        title, path_globs, command_globs, reason, retired = tripwire.parse_page(BOTH_KINDS_PAGE)
         self.assertEqual(title, "Both trigger kinds")
         self.assertEqual(path_globs, ["**/deploy.sh"])
         self.assertEqual(command_globs, ["terraform apply*"])
         self.assertIsNone(reason)
 
     def test_page_with_no_heading_is_skipped(self):
-        title, path_globs, command_globs, reason = tripwire.parse_page(NO_HEADING_PAGE)
+        title, path_globs, command_globs, reason, retired = tripwire.parse_page(NO_HEADING_PAGE)
         self.assertIsNone(title)
         self.assertIsNotNone(reason)
 
     def test_page_with_neither_trigger_line_is_skipped(self):
-        title, path_globs, command_globs, reason = tripwire.parse_page(NO_TRIGGER_PAGE)
+        title, path_globs, command_globs, reason, retired = tripwire.parse_page(NO_TRIGGER_PAGE)
         self.assertEqual(title, "A page with no trigger line")
         self.assertEqual(path_globs, [])
         self.assertEqual(command_globs, [])
         self.assertIsNotNone(reason)
 
     def test_page_with_empty_trigger_paths_line_is_skipped(self):
-        title, path_globs, command_globs, reason = tripwire.parse_page(EMPTY_PATH_GLOBS_PAGE)
+        title, path_globs, command_globs, reason, retired = tripwire.parse_page(EMPTY_PATH_GLOBS_PAGE)
         self.assertEqual(title, "A page with an empty trigger paths line")
         self.assertEqual(path_globs, [])
         self.assertEqual(command_globs, [])
@@ -431,7 +503,7 @@ class TestLoadCorpus(unittest.TestCase):
                 "tests.md": TESTS_PAGE,
             }
         ) as patterns_dir:
-            pages, skipped = tripwire.load_corpus(patterns_dir)
+            pages, retired, skipped = tripwire.load_corpus(patterns_dir)
             names = sorted(p.filename for p in pages)
             self.assertEqual(names, ["gate.md", "tests.md"])
             self.assertEqual(skipped, [])
@@ -444,19 +516,19 @@ class TestLoadCorpus(unittest.TestCase):
                 "no-trigger.md": NO_TRIGGER_PAGE,
             }
         ) as patterns_dir:
-            pages, skipped = tripwire.load_corpus(patterns_dir)
+            pages, retired, skipped = tripwire.load_corpus(patterns_dir)
             self.assertEqual([p.filename for p in pages], ["good.md"])
             skipped_names = {name for name, _reason in skipped}
             self.assertEqual(skipped_names, {"no-heading.md", "no-trigger.md"})
 
     def test_missing_directory_yields_empty_results(self):
-        pages, skipped = tripwire.load_corpus(Path("/nonexistent/precedent/patterns/dir"))
+        pages, retired, skipped = tripwire.load_corpus(Path("/nonexistent/precedent/patterns/dir"))
         self.assertEqual(pages, [])
         self.assertEqual(skipped, [])
 
     def test_command_only_page_loads_with_empty_path_globs(self):
         with TempCorpus({"shell.md": COMMAND_ONLY_PAGE}) as patterns_dir:
-            pages, skipped = tripwire.load_corpus(patterns_dir)
+            pages, retired, skipped = tripwire.load_corpus(patterns_dir)
             self.assertEqual(len(pages), 1)
             self.assertEqual(pages[0].path_globs, [])
             self.assertEqual(pages[0].command_globs, ["gh * --body*", "gh * --body-file*"])
@@ -951,7 +1023,7 @@ class TestInitMode(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             run_init_subprocess(precedent_home=home)
             patterns_dir = Path(home) / "patterns"
-            pages, skipped = tripwire.load_corpus(patterns_dir)
+            pages, retired, skipped = tripwire.load_corpus(patterns_dir)
 
         self.assertEqual(skipped, [])
         self.assertEqual(len(pages), 1)
@@ -1105,6 +1177,417 @@ class TestMatchMode(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
+
+
+class TestSplitEvidence(unittest.TestCase):
+    """split_evidence(): the head is what gets injected, the evidence is
+    what stays on disk."""
+
+    def test_removes_the_evidence_section_and_keeps_the_rest(self):
+        head, evidence = tripwire.split_evidence(EVIDENCE_PAGE)
+        self.assertTrue(evidence.startswith("## Evidence"))
+        self.assertNotIn("## Evidence", head)
+        # The quoted material is gone from what gets injected, and the
+        # section that carried it is what holds it now.
+        self.assertNotIn("matched no files and still exited 0", head)
+        self.assertIn("matched no files and still exited 0", evidence)
+
+    def test_page_without_an_evidence_heading_is_all_head(self):
+        head, evidence = tripwire.split_evidence(GATE_PAGE)
+        self.assertEqual(head, GATE_PAGE)  # byte-for-byte unchanged
+        self.assertEqual(evidence, "")
+
+    def test_heading_level_and_case_and_trailing_text_all_split(self):
+        head, evidence = tripwire.split_evidence(LOWERCASE_EVIDENCE_PAGE)
+        self.assertIn("Body above.", head)
+        self.assertNotIn("Quoted material", head)
+        self.assertTrue(evidence.startswith("### evidence"))
+
+    def test_a_word_starting_with_evidence_is_not_the_heading(self):
+        text = "# T\n\n**Trigger paths:** `a`\n\n## Evidential reasoning\n\nkept\n"
+        head, evidence = tripwire.split_evidence(text)
+        self.assertEqual(head, text)
+        self.assertEqual(evidence, "")
+
+    def test_a_section_after_evidence_is_still_injected(self):
+        # Cutting from the heading to the end of the file was the obvious
+        # rule and it was wrong: both pages written so far put their
+        # checklist BELOW their evidence, so it would have injected "what
+        # goes wrong" and dropped "what to do about it". Only the section
+        # is removed; a page's layout stays the author's business.
+        head, evidence = tripwire.split_evidence(EVIDENCE_PAGE)
+        self.assertIn("Check before you trust a gate", head)
+        self.assertNotIn("Check before you trust a gate", evidence)
+
+    def test_evidence_as_the_last_section_removes_only_itself(self):
+        text = ("# T\n\n**Trigger paths:** `a`\n\n## What goes wrong\n\n"
+                "body\n\n## Evidence\n\n    quoted\n")
+        head, evidence = tripwire.split_evidence(text)
+        self.assertIn("body", head)
+        self.assertNotIn("quoted", head)
+        self.assertIn("quoted", evidence)
+
+    def test_a_deeper_heading_inside_evidence_belongs_to_evidence(self):
+        text = ("# T\n\n**Trigger paths:** `a`\n\n## Evidence\n\n"
+                "### repo one\n\nquoted\n\n## Check\n\nact on this\n")
+        head, evidence = tripwire.split_evidence(text)
+        self.assertIn("act on this", head)
+        self.assertNotIn("repo one", head)
+        self.assertIn("repo one", evidence)
+
+
+class TestEvidenceIsNotInjected(unittest.TestCase):
+    def test_hook_injects_the_head_only(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_hook_subprocess(
+                    edit_payload("Makefile"), patterns_dir=patterns_dir, precedent_home=home
+                )
+            injected = json.loads(result.stdout.strip())["hookSpecificOutput"][
+                "additionalContext"
+            ]
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(injected, EVIDENCE_PAGE_HEAD)
+        self.assertIn("**Class:**", injected)
+        self.assertNotIn("## Evidence", injected)
+        self.assertNotIn("fix(release)", injected)
+        self.assertLess(len(injected), len(EVIDENCE_PAGE))
+
+    def test_page_with_no_evidence_section_is_injected_whole(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_hook_subprocess(
+                    edit_payload("Makefile"), patterns_dir=patterns_dir, precedent_home=home
+                )
+            injected = json.loads(result.stdout.strip())["hookSpecificOutput"][
+                "additionalContext"
+            ]
+
+        self.assertEqual(injected, GATE_PAGE)
+
+    def test_evidence_is_still_on_disk_after_a_match(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_hook_subprocess(
+                    edit_payload("Makefile"), patterns_dir=patterns_dir, precedent_home=home
+                )
+            on_disk = (patterns_dir / "gate.md").read_text(encoding="utf-8")
+
+        self.assertEqual(on_disk, EVIDENCE_PAGE)
+        self.assertIn("fix(release)", on_disk)
+
+    def test_match_mode_prints_the_head(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--path", "Makefile"], patterns_dir=patterns_dir, precedent_home=home
+                )
+
+        self.assertEqual(result.stdout, EVIDENCE_PAGE_HEAD)
+
+    def test_match_full_prints_the_unstripped_page(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--path", "Makefile", "--full"],
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, EVIDENCE_PAGE)
+        self.assertIn("## Evidence", result.stdout)
+        self.assertIn("fix(release)", result.stdout)
+
+    def test_match_full_on_a_miss_still_prints_nothing(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--path", "src/unrelated.py", "--full"],
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_match_full_without_a_subject_is_still_malformed(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--full"], patterns_dir=patterns_dir, precedent_home=home
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+
+class TestInjectedCharsLogging(unittest.TestCase):
+    def test_hit_logs_the_stripped_length_not_the_page_length(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_hook_subprocess(
+                    edit_payload("Makefile"), patterns_dir=patterns_dir, precedent_home=home
+                )
+                entry = json.loads((Path(home) / "tripwire.jsonl").read_text("utf-8").strip())
+
+        self.assertEqual(entry["injected_chars"], len(EVIDENCE_PAGE_HEAD))
+        self.assertLess(entry["injected_chars"], len(EVIDENCE_PAGE))
+
+    def test_miss_logs_zero(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_hook_subprocess(
+                    edit_payload("src/unrelated.py"),
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+                entry = json.loads((Path(home) / "tripwire.jsonl").read_text("utf-8").strip())
+
+        self.assertEqual(entry["injected_chars"], 0)
+
+    def test_match_full_logs_what_it_actually_printed(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_match_subprocess(
+                    ["--path", "Makefile", "--full"],
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+                entry = json.loads((Path(home) / "tripwire.jsonl").read_text("utf-8").strip())
+
+        self.assertEqual(entry["injected_chars"], len(EVIDENCE_PAGE))
+
+    def test_stats_reports_what_was_spent(self):
+        with TempCorpus({"gate.md": EVIDENCE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_hook_subprocess(
+                    edit_payload("Makefile"), patterns_dir=patterns_dir, precedent_home=home
+                )
+                result = run_stats_subprocess(precedent_home=home, patterns_dir=patterns_dir)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("injected: {} chars over 1 invocation(s)".format(len(EVIDENCE_PAGE_HEAD)), result.stdout)
+
+    def test_stats_counts_older_lines_apart_instead_of_guessing(self):
+        # Log lines written before injected_chars existed injected a whole
+        # page, and no number in the log says how big it was. They must not
+        # be folded in at 0.
+        with tempfile.TemporaryDirectory() as home:
+            (Path(home) / "tripwire.jsonl").write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-01-01T00:00:00Z",
+                        "kind": "path",
+                        "subject": "Makefile",
+                        "matched": ["A gate that cannot fail"],
+                        "count": 1,
+                        "pages": 1,
+                        "corpus": "/some/corpus",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = run_stats_subprocess(precedent_home=home)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("invocations predating injected_chars", result.stdout)
+        self.assertNotIn("injected: 0 chars", result.stdout)
+
+
+class TestRetiredPages(unittest.TestCase):
+    """A retired page is a decision, not a fault. It never fires, and it is
+    reported apart from a page that is merely broken."""
+
+    def test_parse_page_reports_the_stated_reason(self):
+        title, path_globs, command_globs, reason, retired = tripwire.parse_page(RETIRED_PAGE)
+        self.assertEqual(title, "A page that stopped being true")
+        self.assertIsNone(reason)
+        self.assertIn("replaced in 2026-08", retired)
+        # Retirement drops the globs: the page cannot fire again.
+        self.assertEqual(path_globs, [])
+        self.assertEqual(command_globs, [])
+
+    def test_a_wrapped_reason_is_read_whole_not_truncated(self):
+        # Every **Trigger:** line in the shipped pages wraps over two
+        # lines, so a **Retired:** reason will too. Half a sentence still
+        # reads like a whole one, which is how a truncation survives.
+        page = (
+            "# Retired with a wrapped reason\n"
+            "\n"
+            "**Trigger paths:** `**/Makefile`\n"
+            "\n"
+            "**Retired:** the runner that caused this was replaced; no\n"
+            "occurrence in six months of edits to the paths it covered.\n"
+            "\n"
+            "## Evidence\n"
+            "\n"
+            "still here\n"
+        )
+        _title, _p, _c, reason, retired = tripwire.parse_page(page)
+        self.assertIsNone(reason)
+        self.assertEqual(
+            retired,
+            "the runner that caused this was replaced; no occurrence in six "
+            "months of edits to the paths it covered.",
+        )
+        self.assertNotIn("still here", retired)
+
+    def test_retired_without_a_reason_is_still_retired(self):
+        _title, _p, _c, reason, retired = tripwire.parse_page(RETIRED_NO_REASON_PAGE)
+        self.assertIsNone(reason)
+        self.assertEqual(retired, tripwire.NO_REASON_GIVEN)
+
+    def test_no_heading_is_broken_even_when_retired(self):
+        _title, _p, _c, reason, retired = tripwire.parse_page(RETIRED_NO_HEADING_PAGE)
+        self.assertIsNone(retired)
+        self.assertIn("no '# ' heading", reason)
+
+    def test_load_corpus_separates_loaded_retired_and_broken(self):
+        with TempCorpus(
+            {
+                "gate.md": GATE_PAGE,
+                "retired.md": RETIRED_PAGE,
+                "broken.md": NO_TRIGGER_PAGE,
+            }
+        ) as patterns_dir:
+            pages, retired, skipped = tripwire.load_corpus(patterns_dir)
+
+        self.assertEqual([p.filename for p in pages], ["gate.md"])
+        self.assertEqual([name for name, _t, _r in retired], ["retired.md"])
+        self.assertEqual([name for name, _r in skipped], ["broken.md"])
+
+    def test_a_retired_page_never_fires_on_a_path_it_used_to_match(self):
+        with TempCorpus({"retired.md": RETIRED_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_hook_subprocess(
+                    edit_payload("Makefile"), patterns_dir=patterns_dir, precedent_home=home
+                )
+                entry = json.loads((Path(home) / "tripwire.jsonl").read_text("utf-8").strip())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(entry["matched"], [])
+        self.assertEqual(entry["pages"], 0)
+
+    def test_a_retired_page_never_fires_via_match_mode_either(self):
+        with TempCorpus({"retired.md": RETIRED_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--path", "Makefile", "--full"],
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+
+        self.assertEqual(result.stdout, "")
+
+    def test_check_reports_all_three_states_in_different_words(self):
+        with TempCorpus(
+            {
+                "gate.md": GATE_PAGE,
+                "retired.md": RETIRED_PAGE,
+                "broken.md": NO_TRIGGER_PAGE,
+            }
+        ) as patterns_dir:
+            result = run_check_subprocess(patterns_dir)
+
+        self.assertEqual(result.returncode, 0)
+        out = result.stdout
+
+        # loaded, with its triggers
+        self.assertIn("pages loaded: 1", out)
+        self.assertIn("A gate that cannot fail", out)
+        self.assertIn("**/Makefile", out)
+
+        # retired on purpose, with its stated reason
+        self.assertIn("retired on purpose: 1", out)
+        self.assertIn("A page that stopped being true", out)
+        self.assertIn("replaced in 2026-08", out)
+
+        # skipped as broken, with what was missing
+        self.assertIn("skipped as broken: 1", out)
+        self.assertIn("broken.md", out)
+        self.assertIn("'**Retired:**' line found", out)
+
+        # and the three wordings are not interchangeable
+        self.assertNotIn("retired.md: no", out)
+        retired_at = out.index("retired on purpose")
+        broken_at = out.index("skipped as broken")
+        self.assertNotEqual(retired_at, broken_at)
+
+    def test_a_corpus_of_only_retired_pages_is_not_reported_as_broken(self):
+        with TempCorpus({"retired.md": RETIRED_PAGE}) as patterns_dir:
+            result = run_check_subprocess(patterns_dir)
+
+        self.assertIn("NOTHING WILL SURFACE", result.stdout)
+        self.assertIn("retired on purpose", result.stdout)
+        self.assertNotIn("NOT WIRED UP", result.stdout)
+
+    def test_session_start_does_not_call_an_all_retired_corpus_an_empty_one(self):
+        # It surfaces nothing either way, but "run --init" is the wrong
+        # advice for a corpus somebody deliberately retired.
+        with TempCorpus({"retired.md": RETIRED_PAGE}) as patterns_dir:
+            result = run_session_start_subprocess(patterns_dir=patterns_dir)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("every one of them is retired", result.stdout)
+        self.assertIn("not a fault", result.stdout)
+        self.assertNotIn("--init", result.stdout)
+
+    def test_stats_lists_retired_and_broken_under_separate_headings(self):
+        with TempCorpus(
+            {"gate.md": GATE_PAGE, "retired.md": RETIRED_PAGE, "broken.md": NO_TRIGGER_PAGE}
+        ) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_hook_subprocess(
+                    edit_payload("Makefile"), patterns_dir=patterns_dir, precedent_home=home
+                )
+                result = run_stats_subprocess(precedent_home=home, patterns_dir=patterns_dir)
+
+        self.assertIn("corpus pages skipped as broken:", result.stdout)
+        self.assertIn("corpus pages retired on purpose:", result.stdout)
+
+
+class TestIndexFileIsNotRead(unittest.TestCase):
+    """The corpus needs no index file. One left over in an existing corpus
+    is still never loaded, and --check says out loud that nothing reads
+    it -- because a file that looks like it is read, and is not, is the
+    failure this corpus documents."""
+
+    def test_an_index_file_is_still_never_loaded_as_a_page(self):
+        with TempCorpus({"index.md": INDEX_PAGE, "gate.md": GATE_PAGE}) as patterns_dir:
+            pages, retired, skipped = tripwire.load_corpus(patterns_dir)
+
+        self.assertEqual([p.filename for p in pages], ["gate.md"])
+        self.assertEqual(retired, [])
+        self.assertEqual(skipped, [])
+
+    def test_an_index_file_never_fires_even_though_it_has_a_trigger_line(self):
+        with TempCorpus({"index.md": INDEX_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_hook_subprocess(
+                    edit_payload("anything.everything"),
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+
+        self.assertEqual(result.stdout, "")
+
+    def test_check_says_it_is_present_and_unread(self):
+        with TempCorpus({"index.md": INDEX_PAGE, "gate.md": GATE_PAGE}) as patterns_dir:
+            result = run_check_subprocess(patterns_dir)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("index.md: present, and nothing reads it", result.stdout)
+        self.assertIn("this --check output is the index", result.stdout)
+
+    def test_check_says_nothing_about_an_index_when_there_is_none(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            result = run_check_subprocess(patterns_dir)
+
+        self.assertNotIn("index.md", result.stdout)
 
 
 class TestStatsMode(unittest.TestCase):

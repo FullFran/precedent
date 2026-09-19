@@ -58,8 +58,16 @@ So the gap is not writing lessons down. It is that:
 `patterns/*.md` is a corpus you write — short pages, one failure class each,
 with real evidence. A `PreToolUse` hook matches the file path or the command
 of an about-to-run `Edit`, `Write` or `Bash` call against each page's
-declared triggers, and puts every matching page's full text into the model's
-context as `additionalContext`.
+declared triggers, and puts every matching page into the model's context as
+`additionalContext`.
+
+What it puts there is the page's **head**: everything above its
+`## Evidence` heading. The evidence is what a human needed in order to admit
+the page — two verbatim occurrences, with sources — and it is the majority
+of a real page's bytes (55% of the example page shipped here). The model
+acts on the class and the trigger, never on the quoted commit messages, so
+the evidence stays on disk where a human, `--match --full` and the miner can
+still read it, instead of being paid for on every match.
 
 It is a hook, not an MCP server: Claude Code reports it as
 `harness-only — no model context cost`, and it costs ~0 tokens and runs in
@@ -165,9 +173,29 @@ lint or format check, or any automated gate.
 - **Trigger command** — backtick-delimited globs matched against the whole
   command string of a `Bash` call.
 
-A page may carry either line, both, or neither. Carrying neither means it is
-loaded but never matches anything, which `--check` reports as skipped. Full
-grammar, matcher semantics and worked examples are in
+A page may carry either line, both, or neither. Carrying neither means it
+could never match anything, which `--check` reports as **skipped as
+broken**, naming what was missing.
+
+The page's `## Evidence` section stays on disk and is not injected. Only
+that section: whatever comes after it, typically the checklist, is injected
+like the rest. A page's layout is its author's business, and evidence is
+what a human needed in order to admit the page, not something the model
+acts on while an edit is pending. Measured on real pages, this removes
+24-48% of what a match costs.
+
+A page can also be **retired** rather than deleted, with a
+`**Retired:** <reason>` line: it loads no triggers, never fires again, and
+`--check` reports it under **retired on purpose** with its stated reason,
+separately from pages that are broken. A decision and a typo must not read
+the same way.
+
+**The corpus needs no index file.** `--check` is the index: it lists every
+page with its triggers, derived from the pages themselves, so it cannot
+drift from them. Nothing reads an `index.md`; one left over in an existing
+corpus is never loaded, and `--check` says so.
+
+Full grammar, matcher semantics and worked examples are in
 [DOCS.md](DOCS.md#the-pattern-page-format).
 
 See [`examples/a-retry-that-never-retries.md`](examples/a-retry-that-never-retries.md)

@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """precedent tripwire — PreToolUse hook surfacing failure-class pattern pages.
 
-Reads the corpus in patterns/*.md (excluding index.md) directly from disk
-and matches it against the tool about to run:
+Reads the corpus in patterns/*.md directly from disk and matches it against
+the tool about to run:
 
   - Edit / Write: trigger-path globs against tool_input.file_path.
   - Bash:         trigger-command globs against tool_input.command.
 
 A page may carry a `**Trigger paths:**` line, a `**Trigger command:**`
-line, both, or neither (in which case it is reported as skipped). Emits
-additionalContext for every matching page. No database, no server, no
-build step: one stdlib-only script invoked by absolute path through
-${CLAUDE_PLUGIN_ROOT}.
+line, both, or neither (in which case it is reported as broken). A page
+carrying a `**Retired:**` line loads no triggers and can never fire again,
+and is reported as retired rather than as broken — a decision and a typo
+must not read the same way. Emits additionalContext for every matching
+page. No database, no server, no build step: one stdlib-only script
+invoked by absolute path through ${CLAUDE_PLUGIN_ROOT}.
+
+What is injected is the page's HEAD: everything above its `## Evidence`
+heading. The evidence itself stays on disk, where a human and the miner
+can still read it, instead of being paid for on every single match. A page
+with no `## Evidence` heading is injected whole. `--match --full` prints
+the unstripped page, for a human checking what a page actually says.
 
 Safety contract: this script must always exit 0. It is invoked as a
 PreToolUse hook, where an exit code of 2 denies the tool call outright.
@@ -28,10 +36,14 @@ Usage:
                             directly (no hookSpecificOutput envelope), for
                             an adapter belonging to an agent other than
                             Claude Code. Takes an optional --agent <name>
-                            (default "claude-code"), recorded in the log.
+                            (default "claude-code"), recorded in the log,
+                            and --full to print the unstripped page.
     tripwire.py --stats     reads the telemetry log back and prints a report.
-    tripwire.py --check     reports what corpus is loaded and each page's
-                            trigger globs, of both kinds.
+    tripwire.py --check     reports what corpus is loaded, each loaded
+                            page's trigger globs, each retired page's
+                            stated reason, and each broken page's fault.
+                            This output IS the corpus index; there is no
+                            index file, and nothing reads one.
 """
 
 import json
@@ -44,6 +56,26 @@ from pathlib import Path
 HEADING_PREFIX = "# "
 TRIGGER_PATH_LINE_PREFIX = "**Trigger paths:**"
 TRIGGER_COMMAND_LINE_PREFIX = "**Trigger command:**"
+RETIRED_LINE_PREFIX = "**Retired:**"
+
+# A `**Retired:**` line with nothing after it is still a retirement — the
+# line is the decision — but it has nothing to report, and saying so is
+# better than printing an empty reason that reads like a missing one.
+NO_REASON_GIVEN = "(no reason given)"
+
+# The corpus needs no index file. This name is excluded from loading for
+# one reason only: an existing corpus may still contain one left over from
+# when this tool reserved the name, and it must not suddenly start being
+# parsed as a pattern page. Nothing reads it; --check says so when it is
+# there, and --check itself is the index (derived from the pages, so it
+# cannot drift from them the way a hand-maintained list does).
+INDEX_FILENAME = "index.md"
+
+# The heading that separates what the model is asked to act on from the
+# justification a human needed in order to admit the page. Matched on the
+# heading text, not the exact line, so `### Evidence`, `## Evidence (two
+# occurrences)` and a lowercased spelling all split the same way.
+EVIDENCE_HEADING_RE = re.compile(r"^#{2,6}[ \t]+Evidence\b", re.IGNORECASE)
 
 # How many leading words of a command line reach the log. See
 # command_log_subject() for why it is words and not characters.
@@ -95,35 +127,111 @@ def get_log_path():
 # ---------------------------------------------------------------------------
 
 class Page:
-    __slots__ = ("title", "path_globs", "command_globs", "content", "filename")
+    __slots__ = ("title", "path_globs", "command_globs", "content", "head", "filename")
 
-    def __init__(self, title, path_globs, command_globs, content, filename):
+    def __init__(self, title, path_globs, command_globs, content, head, filename):
         self.title = title
         self.path_globs = path_globs
         self.command_globs = command_globs
         self.content = content
+        self.head = head
         self.filename = filename
+
+
+def split_evidence(text):
+    """Split a page into (injected, evidence) by removing its Evidence section.
+
+    Only the `## Evidence` section is removed: from that heading down to the
+    next heading of the same or a higher level, or the end of the page. What
+    comes after it -- typically the checklist, which is the part the model
+    actually acts on -- stays in.
+
+    Cutting from the heading to the end of the file instead was the obvious
+    reading and it is wrong. Both pages written so far put their checklist
+    BELOW their evidence, so that rule would have injected "what goes wrong"
+    and dropped "what to do about it", which is backwards. It would also have
+    quietly imposed a section order on anyone writing a page, and a layout
+    constraint nobody states is a layout constraint nobody follows.
+
+    Evidence is what a human needed in order to admit the page: two verbatim
+    occurrences, with sources. The model never acts on it. It stays on disk
+    for the human and the miner, who do read it.
+
+    A page with no Evidence section comes back byte-for-byte unchanged.
+    """
+    lines = text.splitlines(keepends=True)
+    start = None
+    level = 0
+    for i, line in enumerate(lines):
+        match = EVIDENCE_HEADING_RE.match(line)
+        if match:
+            start = i
+            level = len(line) - len(line.lstrip("#").lstrip()) - 1
+            level = line.count("#", 0, len(line) - len(line.lstrip("#")))
+            break
+    if start is None:
+        return text, ""
+
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        stripped = lines[j].lstrip()
+        if stripped.startswith("#"):
+            depth = len(stripped) - len(stripped.lstrip("#"))
+            if 0 < depth <= level:
+                end = j
+                break
+
+    kept = "".join(lines[:start]).rstrip()
+    tail = "".join(lines[end:]).strip()
+    if tail:
+        kept = (kept + "\n\n" + tail) if kept else tail
+    return (kept + "\n" if kept else ""), "".join(lines[start:end])
+
+
+def retirement_reason(lines, idx):
+    """The reason on the `**Retired:**` line at lines[idx], unwrapped.
+
+    A reason is prose, and prose in this corpus wraps: every `**Trigger:**`
+    line in the shipped pages runs over two lines. Reading only the first
+    one would report half a sentence and look like a whole one, which is
+    worse than reporting nothing -- nobody checks a reason that already
+    reads like a reason. Continuation stops where a markdown paragraph
+    stops: a blank line, a new `**Marker:**`, or a heading.
+    """
+    parts = [lines[idx][len(RETIRED_LINE_PREFIX):].strip()]
+    for line in lines[idx + 1:]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("**") or stripped.startswith("#"):
+            break
+        parts.append(stripped)
+    return " ".join(p for p in parts if p).strip() or NO_REASON_GIVEN
 
 
 def parse_page(text):
     """Parse one pattern page's markdown text.
 
-    Returns (title, path_globs, command_globs, skip_reason). skip_reason is
-    None when a title was found and at least one of the two trigger lines
-    contributed at least one backtick-delimited glob; otherwise the fields
-    that were found are still returned and skip_reason explains why the
-    page is unusable as a whole.
+    Returns (title, path_globs, command_globs, skip_reason, retired_reason).
+
+    At most one of the last two is ever set. skip_reason is None when a
+    title was found and at least one of the two trigger lines contributed
+    at least one backtick-delimited glob; otherwise the fields that were
+    found are still returned and skip_reason explains what was missing.
+    retired_reason is set, and skip_reason is None, when the page carries
+    a `**Retired:**` line.
 
     The two trigger lines are independent: a page may carry either, both,
-    or neither. Carrying neither is what makes it skipped.
+    or neither. Carrying neither, with no `**Retired:**` line, is what
+    makes a page broken.
     """
     title = None
     path_globs = []
     command_globs = []
     path_line_seen = False
     command_line_seen = False
+    retired_reason = None
 
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
         if title is None and line.startswith(HEADING_PREFIX):
             title = line[len(HEADING_PREFIX):].strip()
         if line.startswith(TRIGGER_PATH_LINE_PREFIX):
@@ -132,20 +240,35 @@ def parse_page(text):
         if line.startswith(TRIGGER_COMMAND_LINE_PREFIX):
             command_line_seen = True
             command_globs = re.findall(r"`([^`]+)`", line)
+        if retired_reason is None and line.startswith(RETIRED_LINE_PREFIX):
+            retired_reason = retirement_reason(lines, idx)
 
     if title is None:
-        return None, [], [], "no '# ' heading found"
+        # No heading is a broken file, not a retirement, even if it also
+        # carries a `**Retired:**` line: there is nothing to report the
+        # retirement of, and a file this malformed is more likely a
+        # mistake than a decision.
+        return None, [], [], "no '# ' heading found", None
+
+    if retired_reason is not None:
+        # Retirement beats every trigger line on the page. A retired page
+        # loads no globs at all, so it cannot fire again, and the globs it
+        # used to carry are deliberately dropped rather than kept around
+        # where a later reader might think they are still live.
+        return title, [], [], None, retired_reason
 
     if not path_line_seen and not command_line_seen:
         return (
             title,
             [],
             [],
-            "no '**Trigger paths:**' or '**Trigger command:**' line found",
+            "no '**Trigger paths:**', '**Trigger command:**' or "
+            "'**Retired:**' line found",
+            None,
         )
 
     if path_globs or command_globs:
-        return title, path_globs, command_globs, None
+        return title, path_globs, command_globs, None, None
 
     # At least one trigger line was seen, but neither yielded a usable glob.
     if path_line_seen and not command_line_seen:
@@ -154,26 +277,38 @@ def parse_page(text):
         reason = "'**Trigger command:**' line has no backtick-delimited globs"
     else:
         reason = "trigger lines present but neither has a backtick-delimited glob"
-    return title, [], [], reason
+    return title, [], [], reason, None
 
 
 def load_corpus(patterns_dir):
     """Load every usable pattern page under patterns_dir.
 
-    Returns (pages, skipped) where skipped is a list of (filename, reason)
-    for pages that could not be parsed or read. index.md is always excluded.
+    Returns (pages, retired, skipped), three distinct states that must
+    stay distinct: conflating them is how a typo hides as a decision.
+
+      pages    loaded, and able to fire: Page objects.
+      retired  a decision: (filename, title, reason) for each page whose
+               `**Retired:**` line took it out of service. It loads no
+               triggers and never fires, and it is not broken.
+      skipped  broken: (filename, reason) for each page that could not be
+               read or parsed, with what was missing.
+
     Never raises: a missing or unreadable directory yields empty results.
     """
     pages = []
+    retired = []
     skipped = []
 
     try:
         entries = sorted(patterns_dir.glob("*.md"))
     except OSError:
-        return pages, skipped
+        return pages, retired, skipped
 
     for entry in entries:
-        if entry.name == "index.md":
+        # Not a reserved slot for a table of contents, and not a feature:
+        # see INDEX_FILENAME. Excluded only so a leftover index.md is
+        # never parsed as a pattern page. --check reports it as unread.
+        if entry.name == INDEX_FILENAME:
             continue
         try:
             text = entry.read_text(encoding="utf-8")
@@ -181,22 +316,27 @@ def load_corpus(patterns_dir):
             skipped.append((entry.name, "unreadable: {}".format(exc)))
             continue
 
-        title, path_globs, command_globs, reason = parse_page(text)
+        title, path_globs, command_globs, reason, retired_reason = parse_page(text)
+        if retired_reason is not None:
+            retired.append((entry.name, title, retired_reason))
+            continue
         if reason is not None:
             skipped.append((entry.name, reason))
             continue
 
+        head, _evidence = split_evidence(text)
         pages.append(
             Page(
                 title=title,
                 path_globs=path_globs,
                 command_globs=command_globs,
                 content=text,
+                head=head,
                 filename=entry.name,
             )
         )
 
-    return pages, skipped
+    return pages, retired, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +503,8 @@ def command_log_subject(command):
     return " ".join(kept)
 
 
-def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir, agent="claude-code"):
+def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir,
+              agent="claude-code", injected_chars=0):
     """Append one JSONL line for this invocation. Best effort, never raises.
 
     `subject` is what was checked: a file path for kind "path", or a
@@ -386,6 +527,12 @@ def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir, agent="cl
     PreToolUse hook (the default, for every existing call site), or
     whatever another agent's own adapter passes through --match --agent.
     It lets --stats tell them apart once more than one shows up in the log.
+
+    `injected_chars` is how many characters this invocation actually put
+    in front of the model -- the stripped length, after split_evidence(),
+    not the size of the pages on disk. Without it the log records that a
+    page matched but not what the match cost, which is the one number
+    that says whether the corpus is worth what it spends. 0 on a miss.
     """
     try:
         log_path = get_log_path()
@@ -399,6 +546,7 @@ def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir, agent="cl
             "pages": pages_loaded,
             "corpus": str(corpus_dir),
             "agent": agent,
+            "injected_chars": injected_chars,
         }
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
@@ -410,17 +558,23 @@ def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir, agent="cl
 # Shared matching + logging, used by both hook mode and --match mode
 # ---------------------------------------------------------------------------
 
-def _match_and_log(kind, subject, agent):
+def _match_and_log(kind, subject, agent, full=False):
     """Load the corpus, match `subject` against it by `kind` ("path" or
-    "command"), log the invocation, and return the matched pages.
+    "command"), log the invocation, and return the text to emit (None on
+    no match).
 
     This is the one place matching + logging happens. Hook mode and --match
     mode both call it so there is exactly one matching path for both: a
     transport-neutral adapter (see DOCS.md) gets the same behavior the
     PreToolUse hook has always had, including the command redaction rule.
+
+    `full` is the human's escape hatch (--match --full): it emits the
+    unstripped pages instead of their heads. The logged injected_chars is
+    the length of whatever this invocation actually emitted, so the log
+    keeps saying what was really spent rather than what usually is.
     """
     patterns_dir = get_patterns_dir()
-    pages, _skipped = load_corpus(patterns_dir)
+    pages, _retired, _skipped = load_corpus(patterns_dir)
 
     if kind == "path":
         matched = match_path_pages(pages, subject)
@@ -429,26 +583,41 @@ def _match_and_log(kind, subject, agent):
         matched = match_command_pages(pages, subject)
         log_subject = command_log_subject(subject)
 
+    text = _matched_text(matched, full=full)
     titles = [p.title for p in matched]
-    log_event(log_subject, kind, titles, len(pages), patterns_dir, agent)
-    return matched
+    log_event(
+        log_subject,
+        kind,
+        titles,
+        len(pages),
+        patterns_dir,
+        agent,
+        injected_chars=len(text) if text else 0,
+    )
+    return text
 
 
-def _matched_text(matched):
-    """Every matched page's full raw text, joined with a blank line between
-    pages -- exactly as additionalContext carries it. None on no match."""
+def _matched_text(matched, full=False):
+    """Every matched page's injectable text, joined with a blank line
+    between pages -- exactly as additionalContext carries it. None on no
+    match.
+
+    That text is each page's HEAD (everything above `## Evidence`), not
+    its full contents: see split_evidence(). `full=True` asks for the
+    unstripped pages instead, which only --match --full does, for a human
+    reading a page rather than a model acting on one.
+    """
     if not matched:
         return None
-    return "\n\n".join(p.content for p in matched)
+    return "\n\n".join((p.content if full else p.head) for p in matched)
 
 
 # ---------------------------------------------------------------------------
 # Hook mode
 # ---------------------------------------------------------------------------
 
-def _emit(matched):
-    text = _matched_text(matched)
-    if text is None:
+def _emit(text):
+    if not text:
         return
     output = {
         "hookSpecificOutput": {
@@ -480,16 +649,14 @@ def run_hook():
         if not isinstance(file_path, str) or not file_path:
             return
 
-        matched = _match_and_log("path", file_path, "claude-code")
-        _emit(matched)
+        _emit(_match_and_log("path", file_path, "claude-code"))
 
     elif tool_name == "Bash":
         command = tool_input.get("command")
         if not isinstance(command, str) or not command:
             return
 
-        matched = _match_and_log("command", command, "claude-code")
-        _emit(matched)
+        _emit(_match_and_log("command", command, "claude-code"))
 
     # Any other tool_name (or none at all): do nothing. Nothing in this
     # corpus is triggered by any tool other than Edit, Write and Bash, and
@@ -517,6 +684,12 @@ def run_match():
     --agent <name> is recorded in the log entry as "agent" (default
     "claude-code"), so --stats can tell which agent fired a given line.
 
+    --full prints the unstripped page instead of the head an agent gets.
+    What an agent is given is deliberately not the whole page (see
+    split_evidence), and a human checking what a page actually says needs
+    a way to read the part that stayed on disk without opening the file
+    by hand and working out which one matched.
+
     Always exits 0, same as every other mode (see main()): this can be
     invoked from inside another agent's own process rather than as a
     subprocess, so it must never raise or block that process either.
@@ -525,6 +698,7 @@ def run_match():
     path = None
     command = None
     agent = "claude-code"
+    full = False
 
     i = 0
     while i < len(argv):
@@ -538,6 +712,9 @@ def run_match():
         elif arg == "--agent" and i + 1 < len(argv):
             agent = argv[i + 1]
             i += 2
+        elif arg == "--full":
+            full = True
+            i += 1
         else:
             # An unrecognised flag, or a flag with no value: malformed.
             return
@@ -549,14 +726,13 @@ def run_match():
     if path is not None:
         if not path:
             return
-        matched = _match_and_log("path", path, agent)
+        text = _match_and_log("path", path, agent, full=full)
     else:
         if not command:
             return
-        matched = _match_and_log("command", command, agent)
+        text = _match_and_log("command", command, agent, full=full)
 
-    text = _matched_text(matched)
-    if text is not None:
+    if text:
         sys.stdout.write(text)
 
 
@@ -615,7 +791,9 @@ def run_init():
         print("  set PRECEDENT_PATTERNS to a writable directory and try again.")
         return
 
-    existing = sorted(q.name for q in patterns_dir.glob("*.md") if q.name != "index.md")
+    existing = sorted(
+        q.name for q in patterns_dir.glob("*.md") if q.name != INDEX_FILENAME
+    )
     if existing:
         print("  already holds {} page(s): {}".format(len(existing), ", ".join(existing)))
         print("  nothing written. Run --check to see what loads.")
@@ -650,10 +828,20 @@ def run_session_start():
     """
     patterns_dir = get_patterns_dir()
     try:
-        pages, _skipped = load_corpus(patterns_dir)
+        pages, retired, _skipped = load_corpus(patterns_dir)
     except Exception:
         return
     if pages:
+        return
+
+    # An all-retired corpus surfaces nothing either, but it is a decision,
+    # not a missing install, and telling someone to run --init over it
+    # would be telling them to fix something that is not broken.
+    if retired:
+        print("precedent has {} page(s) in {}, and every one of them is "
+              "retired, so it will not surface anything. That is a state, "
+              "not a fault. Run the tripwire with --check to see each one "
+              "and why it was retired.".format(len(retired), patterns_dir))
         return
 
     print("precedent is installed but has no pattern pages, so it will not "
@@ -680,7 +868,18 @@ def run_version():
 
 def run_check():
     """Say out loud where the corpus is and what loaded, so a broken install
-    is visible in one command instead of showing up as silence."""
+    is visible in one command instead of showing up as silence.
+
+    This output is also the corpus index. It lists every page and its
+    triggers, derived from the pages themselves, so it cannot drift from
+    them -- which a second, hand-maintained copy in an index file always
+    eventually does. There is no index file, and nothing reads one.
+
+    The three states it reports are kept apart on purpose: a page that
+    loaded, a page retired on purpose with its stated reason, and a page
+    skipped as broken with what was missing. Printed as one list they
+    would read the same, and a typo would hide as a decision.
+    """
     patterns_dir = get_patterns_dir()
     if os.environ.get("PRECEDENT_PATTERNS"):
         source = "PRECEDENT_PATTERNS"
@@ -699,7 +898,7 @@ def run_check():
         print("  Set PRECEDENT_PATTERNS to the corpus directory.")
         return
 
-    pages, skipped = load_corpus(patterns_dir)
+    pages, retired, skipped = load_corpus(patterns_dir)
     print("  pages loaded: {}".format(len(pages)))
     for page in pages:
         print("    {}".format(page.title))
@@ -713,13 +912,41 @@ def run_check():
                 " ".join(page.command_globs) if page.command_globs else "(none)"
             )
         )
+
+    # Three states, three wordings. A retired page is a decision someone
+    # made and can defend; a broken page is a mistake nobody noticed.
+    if retired:
+        print("  retired on purpose: {}".format(len(retired)))
+        for filename, title, reason in retired:
+            print("    {}  ({})".format(title, filename))
+            print("      reason: {}".format(reason))
+            print("      loads no triggers and can never fire. Still on disk.")
     if skipped:
-        print("  skipped:")
+        print("  skipped as broken: {}".format(len(skipped)))
         for filename, reason in skipped:
             print("    {}: {}".format(filename, reason))
+
+    # The corpus needs no index file. Say so where someone will see it,
+    # rather than excluding the file silently and letting it look read.
+    try:
+        has_index = (patterns_dir / INDEX_FILENAME).is_file()
+    except OSError:
+        has_index = False
+    if has_index:
+        print("  {}: present, and nothing reads it.".format(INDEX_FILENAME))
+        print("      It is not loaded and is not a pattern page. The corpus")
+        print("      needs no index file: this --check output is the index,")
+        print("      and it is derived from the pages themselves, so it")
+        print("      cannot drift from them. Delete it, or keep it as notes")
+        print("      for yourself, but nothing will ever read it.")
+
     if not pages:
         print("")
-        print("  NOT WIRED UP. The directory exists but carries no usable pages.")
+        if retired and not skipped:
+            print("  NOTHING WILL SURFACE. The directory exists and every page")
+            print("  in it is retired on purpose. That is a state, not a fault.")
+        else:
+            print("  NOT WIRED UP. The directory exists but carries no usable pages.")
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +998,9 @@ def run_stats():
     agent_totals = {}
     blind = 0
     blind_corpora = {}
+    injected_total = 0
+    injected_invocations = 0
+    injected_unknown = 0
 
     with open(log_path, "r", encoding="utf-8") as fh:
         for raw_line in fh:
@@ -806,6 +1036,21 @@ def run_stats():
                 blind += 1
                 corpus = entry.get("corpus") or "(unknown)"
                 blind_corpora[corpus] = blind_corpora.get(corpus, 0) + 1
+
+            # Log lines written before the head/evidence split existed
+            # carry no injected_chars at all, and every one of them
+            # injected a whole page rather than a head. There is no honest
+            # number to substitute for them, so they are counted apart
+            # instead of being folded in at 0 (which would understate what
+            # the corpus used to cost) or at their page size (which is not
+            # recorded anywhere in the log).
+            injected = entry.get("injected_chars")
+            if isinstance(injected, int) and not isinstance(injected, bool):
+                if injected > 0:
+                    injected_total += injected
+                    injected_invocations += 1
+            else:
+                injected_unknown += 1
 
             if matched:
                 hits += 1
@@ -862,6 +1107,20 @@ def run_stats():
     print("  hits: {}".format(hits))
     print("  misses: {}".format(misses))
     print("  hit rate: {}".format("{:.1%}".format(hits / total) if total else "n/a"))
+    if injected_invocations:
+        print(
+            "  injected: {} chars over {} invocation(s) (mean {})".format(
+                injected_total,
+                injected_invocations,
+                int(round(injected_total / injected_invocations)),
+            )
+        )
+    if injected_unknown:
+        print(
+            "  invocations predating injected_chars (not counted above): {}".format(
+                injected_unknown
+            )
+        )
     if first_ts and last_ts:
         print("  span: {} .. {}".format(first_ts, last_ts))
     if malformed_lines:
@@ -877,11 +1136,18 @@ def run_stats():
     print_freq_table_by_kind(miss_subject_freq)
 
     patterns_dir = get_patterns_dir()
-    _pages, skipped = load_corpus(patterns_dir)
-    print("\ncorpus pages skipped:")
+    _pages, retired, skipped = load_corpus(patterns_dir)
+    print("\ncorpus pages skipped as broken:")
     if skipped:
         for filename, reason in skipped:
             print("  {}: {}".format(filename, reason))
+    else:
+        print("  (none)")
+
+    print("\ncorpus pages retired on purpose:")
+    if retired:
+        for filename, title, reason in retired:
+            print("  {} ({}): {}".format(title, filename, reason))
     else:
         print("  (none)")
 

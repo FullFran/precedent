@@ -6,6 +6,8 @@ miner. For the pitch and a quickstart, see [README.md](README.md).
 ## Contents
 
 - [The pattern page format](#the-pattern-page-format)
+- [What is injected: the head, not the page](#what-is-injected-the-head-not-the-page)
+- [Retiring a page](#retiring-a-page)
 - [The two matchers](#the-two-matchers)
 - [The hook contract](#the-hook-contract)
 - [Configuration](#configuration)
@@ -13,14 +15,21 @@ miner. For the pitch and a quickstart, see [README.md](README.md).
 - [Telemetry](#telemetry)
 - [Agent support](#agent-support)
 - [`tools/mine.py`](#toolsminepy)
+- [The decision ledger](#the-decision-ledger)
 - [Troubleshooting](#troubleshooting)
 
 ## The pattern page format
 
 A pattern page is one markdown file under the corpus directory (see
-[Configuration](#configuration)). `patterns/index.md`, if present, is always
-excluded from loading — it is reserved for a human-readable table of
-contents, not a pattern itself.
+[Configuration](#configuration)).
+
+**The corpus needs no index file.** There is no table-of-contents page to
+maintain and nothing reads one. [`--check`](#--check) *is* the index: it
+lists every page with its triggers, derived from the pages themselves, so
+it cannot drift from them the way a second hand-maintained copy does. A
+file named `index.md` left over in an existing corpus is still never
+loaded — it would otherwise start being parsed as a pattern page — and
+`--check` reports that it is present and that nothing reads it.
 
 A page is parsed by scanning its lines, independently of one another:
 
@@ -29,33 +38,108 @@ A page is parsed by scanning its lines, independently of one another:
 | `# <title>` | yes | The first line starting with `# ` becomes the page's title. Everything before it is ignored; everything after the first such line does not change the title. |
 | `**Trigger paths:**` followed by one or more backtick-delimited globs | no | Matched against `tool_input.file_path` on an `Edit` or `Write` call, with [path glob](#path-globs) semantics. |
 | `**Trigger command:**` followed by one or more backtick-delimited globs | no | Matched against `tool_input.command` on a `Bash` call, with [command glob](#command-globs) semantics. |
+| `**Retired:**` followed by a reason | no | Takes the page out of service: it loads no triggers, never fires again, and is reported by `--check` as retired rather than as broken. See [Retiring a page](#retiring-a-page). |
 
 Everything else in the file — a `**Trigger:**` prose line, `**Class:**`, `##`
 sections, evidence, checklists — is free-form markdown. It is not parsed at
-all; it is only ever emitted whole, as `additionalContext`, when the page
-matches.
+all. What of it reaches the model is decided by one rule only, the
+`## Evidence` heading: see [What is injected](#what-is-injected-the-head-not-the-page).
 
 **What happens when a required piece is missing:**
 
 - **No `# ` heading anywhere in the file.** The page is skipped entirely
   (title is `None`; nothing is loaded). `--check` and `--stats` report it as
-  skipped with the reason `no '# ' heading found`.
-- **A heading, but neither a `**Trigger paths:**` nor a `**Trigger command:**`
-  line.** The page is skipped: `no '**Trigger paths:**' or '**Trigger
-  command:**' line found`. A title alone is not enough to make a page
-  loadable, because it could never match anything.
+  **broken**, with the reason `no '# ' heading found`. That holds even if
+  the file carries a `**Retired:**` line: a file this malformed is more
+  likely a mistake than a decision, and there is no title to report the
+  retirement of.
+- **A heading, but none of `**Trigger paths:**`, `**Trigger command:**` or
+  `**Retired:**`.** The page is broken: `no '**Trigger paths:**',
+  '**Trigger command:**' or '**Retired:**' line found`. A title alone is
+  not enough to make a page loadable, because it could never match
+  anything.
 - **A trigger line is present but has no backtick-delimited glob on it**
-  (e.g. `**Trigger paths:**` with nothing after it). The page is skipped,
+  (e.g. `**Trigger paths:**` with nothing after it). The page is broken,
   with a reason naming which line was empty.
 - **Only one of the two trigger lines is present.** That is not an error —
   a page may be path-only, command-only, or carry both. It loads normally
   with an empty list for the kind it doesn't declare.
 
 A page that fails to parse is never fatal to the rest of the corpus: it is
-recorded in `skipped` (visible via `--check` and `--stats`) and every other
+recorded as broken (visible via `--check` and `--stats`) and every other
 page still loads. A page that can't be read at all (I/O error, or bytes that
-aren't valid UTF-8) is skipped the same way, with the underlying exception as
-the reason.
+aren't valid UTF-8) is reported the same way, with the underlying exception
+as the reason.
+
+## What is injected: the head, not the page
+
+A matching page is **not** injected whole. What reaches the model is the
+page's **head**: everything above its `## Evidence` heading. A page with no
+such heading is injected exactly as it is, byte for byte.
+
+The evidence stays on disk. It is still read by a human opening the file,
+by `--match --full`, and by anyone auditing why a page was admitted — it
+just stops being paid for on every single match. Evidence is what a human
+needed in order to admit the page: two verbatim occurrences, with sources
+(see [CONTRIBUTING.md](CONTRIBUTING.md)). The model acts on the class, the
+trigger and the guidance; it never acts on the quoted commit messages that
+justified writing them down. On the shipped example page that is 55% of the
+file, and on a page with a real multi-occurrence evidence section it is
+routinely more.
+
+The heading is matched on its text, not on an exact line, so `## Evidence`,
+`### Evidence` and `## Evidence (two occurrences)` all split the same way,
+and case does not matter. A heading like `## Evidential reasoning` is not a
+match — the word has to be `Evidence`.
+
+**The cut is at the heading, not around the section.** Everything below
+`## Evidence` stays on disk too, including any section written after it.
+Write the part you want read before an edit *above* that heading. This is a
+real constraint on page layout: the starter page `--init` writes, and
+[`examples/a-retry-that-never-retries.md`](examples/a-retry-that-never-retries.md),
+both put their `## Check before you trust it` checklist below the evidence,
+so that checklist is on disk and is not injected. Move it above
+`## Evidence` in your own pages if you want the model to read it.
+
+[`--match --full`](#--match) prints the unstripped page, for a human
+checking what a page actually says. The telemetry log records
+`injected_chars`, the length of what was really put in front of the model,
+and [`--stats`](#--stats) totals it.
+
+## Retiring a page
+
+A page stops being true. The runner that caused it was replaced; the
+language moved; the class stopped recurring. Deleting the page throws away
+the evidence, and leaving it loaded spends context on every matching edit
+for a class that no longer happens.
+
+A `**Retired:**` line, with a reason, is the third option:
+
+```markdown
+# A page that stopped being true
+
+**Trigger paths:** `**/Makefile`
+
+**Retired:** the runner that caused this was replaced; no occurrence in
+six months of edits to the paths it covered.
+```
+
+- It loads **no triggers at all** — the globs it used to carry are dropped
+  rather than kept where a later reader might think they are still live —
+  so it can never fire again, through the hook or through `--match`.
+- `--check` and `--stats` report it under **retired**, with its stated
+  reason, separately from pages that are broken. Retirement is a decision
+  someone made and can defend; a broken page is a mistake nobody noticed,
+  and printing them in one list is how a typo comes to read like a
+  decision.
+- The reason may wrap over several lines: it is read to the end of the
+  markdown paragraph (a blank line, a new `**Marker:**`, or a heading).
+  Reading only the first line would report half a sentence, which still
+  reads like a whole one.
+- `**Retired:**` with nothing after it is still a retirement — the line is
+  the decision — and is reported as `(no reason given)`.
+- The file, including its evidence, stays on disk and stays readable by
+  `tools/mine.py` and by a human.
 
 ## The two matchers
 
@@ -146,8 +230,10 @@ non-object payload, a missing `tool_input`, or a missing/empty
 {"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"..."}}
 ```
 
-`additionalContext` is every matching page's full raw text, joined with a
-blank line between pages. This exact shape is required, and it is the
+`additionalContext` is every matching page's **head** — everything above
+its `## Evidence` heading, or the whole page if it has none (see
+[What is injected](#what-is-injected-the-head-not-the-page)) — joined with
+a blank line between pages. This exact shape is required, and it is the
 *only* shape that reaches the model **from a `PreToolUse` hook**:
 
 - Plain stdout from a `PreToolUse` hook reaches only a debug log.
@@ -227,8 +313,13 @@ Reads the hook JSON payload from stdin. No flag.
 ```
 $ echo '{"tool_name":"Edit","tool_input":{"file_path":".github/workflows/ci.yml"}}' \
     | python3 plugin/claude-code/scripts/tripwire.py
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"# A gate that cannot fail\n\n**Trigger:** you are adding, changing, or relying on CI, a test runner, a\nlint or format check, or any automated gate.\n\n**Trigger paths:** `.github/workflows/**` `**/Makefile`\n\n**Class:** the check reports success without having checked.\n\n## What goes wrong\n\nA gate is added, it goes green, and everyone reads green as evidence. But the\ngate never ran, or ran against nothing, or its exit status was swallowed on\nthe way out. The failure is silent by construction: a gate that cannot fail\nlooks exactly like a gate that passes.\n\n## Evidence\n\nReplace this section with your own, verbatim. Two independent occurrences in\ndifferent places, quoted from commits, issues or logs. A claim nobody can\ncheck is not evidence, and a page admitted without it is just an opinion that\nfires on every edit.\n\n## Check before you trust a gate\n\n- Make it fail on purpose, once, and watch it go red. A gate never observed\n  failing is not yet a gate.\n- Check the exit status survives the whole pipeline. A pipe, a `tail`, a\n  `|| true` or a trailing command replaces it.\n- Count what ran. A runner that discovers work can discover nothing and still\n  exit 0; assert the count is non-zero.\n"}}
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"# A gate that cannot fail\n\n**Trigger:** you are adding, changing, or relying on CI, a test runner, a\nlint or format check, or any automated gate.\n\n**Trigger paths:** `.github/workflows/**` `**/Makefile`\n\n**Class:** the check reports success without having checked.\n\n## What goes wrong\n\nA gate is added, it goes green, and everyone reads green as evidence. But the\ngate never ran, or ran against nothing, or its exit status was swallowed on\nthe way out. The failure is silent by construction: a gate that cannot fail\nlooks exactly like a gate that passes.\n"}}
 ```
+
+That is the starter page's head. Its `## Evidence` section, and everything
+below that heading, stayed on disk — see
+[What is injected](#what-is-injected-the-head-not-the-page), and
+[`--match --full`](#--match) to read the rest.
 
 A miss produces nothing on stdout:
 
@@ -251,6 +342,7 @@ $ echo '{"tool_name":"Bash","tool_input":{"command":"gh issue comment --body \"s
 ```
 tripwire.py --match --path <path>
 tripwire.py --match --command <command>
+tripwire.py --match --path <path> --full
 ```
 
 A transport-neutral match mode: it answers the matching question directly,
@@ -264,12 +356,38 @@ Exactly one of `--path` or `--command` is required. An optional `--agent
 <name>` (default `claude-code`) is recorded in the log entry as `agent`, so
 [`--stats`](#--stats) can tell which agent fired a given line.
 
-Prints every matching page's markdown, joined by a blank line — exactly what
+Prints every matching page's head, joined by a blank line — exactly what
 `additionalContext` carries in hook mode, just without the JSON wrapper —
 or nothing at all on no match:
 
 ```
 $ python3 plugin/claude-code/scripts/tripwire.py --match --path Makefile
+# A gate that cannot fail
+
+**Trigger:** you are adding, changing, or relying on CI, a test runner, a
+lint or format check, or any automated gate.
+
+**Trigger paths:** `.github/workflows/**` `**/Makefile`
+
+**Class:** the check reports success without having checked.
+
+## What goes wrong
+
+A gate is added, it goes green, and everyone reads green as evidence. But the
+gate never ran, or ran against nothing, or its exit status was swallowed on
+the way out. The failure is silent by construction: a gate that cannot fail
+looks exactly like a gate that passes.
+
+$ python3 plugin/claude-code/scripts/tripwire.py --match --path src/unrelated.py
+$
+```
+
+`--full` prints the unstripped page instead — the evidence an agent is
+deliberately not given, for a human checking what a page actually says
+without having to work out which file matched:
+
+```
+$ python3 plugin/claude-code/scripts/tripwire.py --match --path Makefile --full
 # A gate that cannot fail
 
 **Trigger:** you are adding, changing, or relying on CI, a test runner, a
@@ -301,10 +419,13 @@ fires on every edit.
   `|| true` or a trailing command replaces it.
 - Count what ran. A runner that discovers work can discover nothing and still
   exit 0; assert the count is non-zero.
-
-$ python3 plugin/claude-code/scripts/tripwire.py --match --path src/unrelated.py
-$
 ```
+
+`--full` still logs, like every other invocation, and its `injected_chars`
+is the length of what it actually printed — the log says what was really
+spent, not what usually is. `--full` on its own, with neither `--path` nor
+`--command`, is malformed the same way as before: no output, no log entry,
+exit 0.
 
 A command match, with `--agent` set the way `plugin/opencode/precedent.ts`
 sets it:
@@ -326,7 +447,7 @@ subject is still redacted to its leading words the same way hook mode
 redacts it:
 
 ```
-{"ts": "2026-09-19T17:05:35Z", "kind": "command", "subject": "gh issue comment", "matched": ["Backticks execute in a shell body"], "count": 1, "pages": 2, "corpus": ".precedent/patterns", "agent": "opencode"}
+{"ts": "2026-09-19T20:09:29Z", "kind": "command", "subject": "gh issue comment", "matched": ["Backticks execute in a shell body"], "count": 1, "pages": 2, "corpus": ".precedent/patterns", "agent": "opencode", "injected_chars": 231}
 ```
 
 Neither `--path` nor `--command`, or both at once, is a malformed
@@ -382,7 +503,15 @@ precedent tripwire init
 
 Says out loud where the corpus is, whether it exists, and exactly what
 loaded — so a broken install is visible in one command instead of showing up
-as silence.
+as silence. **This output is the corpus index**, derived from the pages
+themselves; there is no index file and nothing reads one.
+
+It reports three states, in three different wordings, because printed as
+one list they would read the same and a typo would hide as a decision:
+
+- **loaded**, with its triggers, of both kinds;
+- **retired on purpose**, with its stated reason;
+- **skipped as broken**, with what was missing.
 
 ```
 $ python3 plugin/claude-code/scripts/tripwire.py --check
@@ -391,10 +520,27 @@ precedent tripwire check
   corpus:  .precedent/patterns  (from PRECEDENT_PATTERNS)
   exists:  True
   pages loaded: 1
-    Backticks execute in a shell body
-      trigger paths:   (none)
-      trigger command: gh * --body* gh * --body-file*
+    A retry that never retries
+      trigger paths:   **/retry*.* **/*backoff*.*
+      trigger command: * --retries *
+  retired on purpose: 1
+    A page that stopped being true  (a-page-that-stopped-being-true.md)
+      reason: the runner that caused this was replaced; no occurrence in six months of edits to the paths it covered.
+      loads no triggers and can never fire. Still on disk.
+  skipped as broken: 1
+    half-written.md: no '**Trigger paths:**', '**Trigger command:**' or '**Retired:**' line found
+  index.md: present, and nothing reads it.
+      It is not loaded and is not a pattern page. The corpus
+      needs no index file: this --check output is the index,
+      and it is derived from the pages themselves, so it
+      cannot drift from them. Delete it, or keep it as notes
+      for yourself, but nothing will ever read it.
 ```
+
+The `index.md` paragraph appears only when such a file is actually there.
+A corpus whose pages are *all* retired is not reported as broken either —
+it says `NOTHING WILL SURFACE ... every page in it is retired on purpose.
+That is a state, not a fault.`
 
 When the corpus directory doesn't exist at all:
 
@@ -445,37 +591,49 @@ precedent is installed but has no pattern pages, so it will not surface anything
 
 An unusable corpus (every page fails to parse) is treated the same as a
 missing one — both mean the hook has nothing to surface, so both get the
-notice. Like every other mode, it always exits 0: an unreadable corpus
+notice. A corpus whose pages are all **retired** surfaces nothing either,
+but it gets a different sentence, because "run `--init`" is the wrong
+advice for something somebody deliberately took out of service:
+
+```
+$ PRECEDENT_HOME=.precedent python3 plugin/claude-code/scripts/tripwire.py --session-start
+precedent has 1 page(s) in .precedent/patterns, and every one of them is retired, so it will not surface anything. That is a state, not a fault. Run the tripwire with --check to see each one and why it was retired.
+```
+
+Like every other mode, it always exits 0: an unreadable corpus
 directory is swallowed the same way `load_corpus()` swallows it everywhere
 else, and never raises.
 
 ### `--stats`
 
-Reads the telemetry log back and reports hits, misses, and a breakdown by
-kind (`path` vs `command`).
+Reads the telemetry log back and reports hits, misses, a breakdown by
+kind (`path` vs `command`), and what the corpus actually spent.
 
 ```
 $ python3 plugin/claude-code/scripts/tripwire.py --stats
 precedent tripwire stats
   log: .precedent/tripwire.jsonl
-  invocations: 2
-  by kind: path=2 command=0
-  hits: 1
+  invocations: 4
+  by kind: path=3 command=1
+  hits: 3
   misses: 1
-  hit rate: 50.0%
-  span: 2026-09-19T14:14:15Z .. 2026-09-19T14:14:15Z
+  hit rate: 75.0%
+  injected: 1816 chars over 3 invocation(s) (mean 605)
+  span: 2026-09-19T20:09:11Z .. 2026-09-19T20:09:11Z
 
 matched patterns by frequency:
   [path]
      1  A gate that cannot fail
+     1  A retry that never retries
   [command]
-  (none)
+     1  A retry that never retries
 
 matched subjects by frequency:
   [path]
      1  .github/workflows/ci.yml
+     1  src/retry_client.py
   [command]
-  (none)
+     1  curl
 
 subjects that did not match, by frequency:
   [path]
@@ -483,9 +641,20 @@ subjects that did not match, by frequency:
   [command]
   (none)
 
-corpus pages skipped:
-  (none)
+corpus pages skipped as broken:
+  half-written.md: no '**Trigger paths:**', '**Trigger command:**' or '**Retired:**' line found
+
+corpus pages retired on purpose:
+  A page that stopped being true (a-page-that-stopped-being-true.md): the runner that caused this was replaced; no occurrence in six months of edits to the paths it covered.
 ```
+
+The `injected:` line totals the `injected_chars` field (see
+[Telemetry](#telemetry)) over the invocations that injected anything, so it
+is what the corpus actually cost rather than how big the pages are. Log
+lines written before that field existed injected whole pages, and nothing
+in the log says how big those were — they are counted apart, as
+`invocations predating injected_chars (not counted above): N`, rather than
+folded in at 0.
 
 `by agent:` only appears once more than one agent shows up in the log — a
 single-agent install (every install that predates
@@ -557,6 +726,7 @@ never affected by whether the log write succeeded.
 | `pages` | integer | How many pattern pages were loaded for this invocation. `0` means the hook ran against an empty or missing corpus — see the blind-run warning under [`--stats`](#--stats). |
 | `corpus` | string | The resolved corpus directory path for this invocation. |
 | `agent` | string | Who fired this invocation: `"claude-code"` for the `PreToolUse` hook, or whatever another agent's adapter passed to [`--match --agent`](#--match) (`"opencode"` for `plugin/opencode/precedent.ts`). |
+| `injected_chars` | integer | How many characters this invocation actually put in front of the model — the *stripped* length, after the head/evidence split, not the size of the pages on disk. `0` on a miss. With [`--match --full`](#--match) it is the length of the unstripped text that call really printed. |
 
 Older log lines, written before command triggers existed, carry `path`
 instead of `subject` and have no `kind` field at all. `--stats` reads both:
@@ -564,8 +734,11 @@ a missing `kind` is treated as `"path"` (every log line from before command
 triggers existed came from a path match), and `subject` falls back to the
 legacy `path` field when absent. Older log lines also predate `agent`
 entirely — `--stats` treats a missing `agent` as `"claude-code"`, since
-every one of them came from the hook before `--match` existed. `tripwire.jsonl`
-is meant to accumulate across format changes without breaking `--stats`.
+every one of them came from the hook before `--match` existed, and they
+predate `injected_chars` too, which is why `--stats` counts those apart
+instead of reading a missing field as a zero-cost injection.
+`tripwire.jsonl` is meant to accumulate across format changes without
+breaking `--stats`.
 
 ### The redaction rule
 
@@ -769,6 +942,9 @@ write them.
    is the re-derivation this tool exists to surface.
 7. Prints a report, or, with `--draft <group id>`, a skeleton pattern page
    pre-filled with that group's verbatim evidence.
+8. With `--ledger <path>`, reads a [decision ledger](#the-decision-ledger)
+   and skips any candidate group whose observation ids were already
+   rejected in it, saying how many it skipped and why.
 
 **What it cannot do:** it does not identify a failure class. Its own report
 says so explicitly, every time, because lexical similarity is not the same
@@ -838,6 +1014,13 @@ candidate group 1 -- 2 project(s), 2 observation(s), 2026-06-01 to 2026-07-14
 ## Check before you trust this
 
 - TODO
+
+<!-- terms this group had in common, for reference only, not evidence: without, reported, ever, gate, success, suite, running, test -->
+
+<!-- ledger line for this group, once you decide:
+- YYYY-MM-DD | admitted | TODO-page-name | obs: 1,2 | TODO why
+     (rejected/admitted/retired are the three decisions; keep the obs ids exactly as written,
+     they are the key a rejected group is recognised by next run) -->
 ```
 
 Every field in a draft's Evidence section is a verbatim quote from the
@@ -846,7 +1029,86 @@ hand-written page (see [CONTRIBUTING.md](CONTRIBUTING.md)) applies here too:
 a claim nobody can check is not evidence. `--help` lists every flag,
 including `--limit`, `--similarity` and `--db`; group ids are only stable
 within one invocation that shares `--db`, `--min-projects` and
-`--similarity` — they are not persisted anywhere.
+`--similarity` — they are not persisted anywhere, which is exactly why the
+ledger line a draft carries is keyed by observation id.
+
+## The decision ledger
+
+`mine.py` proposes the same groups on every run. A group looked at once and
+rejected costs the same attention the second time it is proposed, and the
+third. The ledger is where that decision is written down — and, more to the
+point, **something reads it**: a ledger nothing consults is a file that
+claims to matter and does not, which is the failure this whole corpus is
+about.
+
+It is an append-only markdown file, one decision per line:
+
+```markdown
+- 2026-09-19 | rejected | miner group | obs: 6570,7523 | shared one generic word; unrelated documents
+- 2026-09-19 | admitted | a-gate-that-cannot-fail | obs: 101,102 | two occurrences, two repos
+- 2026-09-20 | retired  | some-page | obs: - | stopped matching anything real
+```
+
+| Field | Meaning |
+|---|---|
+| `YYYY-MM-DD` | when the decision was made. |
+| decision | one of `rejected`, `admitted`, `retired`. Anything else is a malformed line (a typo'd decision must not silently decide nothing). |
+| subject | free text: what the decision was about — a page name, or just `miner group`. |
+| `obs: <ids>` | comma-separated observation ids, or `-` for none. **This is the key.** |
+| note | free text: why. Reported back when the entry suppresses something. |
+
+Blank lines, headings and ordinary prose are allowed and are not entries.
+A line that looks like an entry and does not parse is ignored, counted, and
+reported with its reason — one bad line never aborts a run and never
+invalidates the lines around it.
+
+**Why observation ids and not group ids.** A group id here is assigned by
+rank within one invocation (`assemble_groups` numbers the ranked list
+1..n) and is persisted nowhere, so `group 3` means a different group
+tomorrow, or after one new lesson lands in the store, or under a different
+`--similarity`. Observation ids come from the store and do not move.
+
+`--ledger <path>` reads it and drops any candidate group whose member id
+set **equals** one that was rejected — equality, not overlap: a group that
+gained or lost a member has not been ruled on and is still proposed. Only
+`rejected` entries suppress; `admitted` and `retired` record what happened
+to a page, not that the group should stop being proposed.
+
+What it did is printed at the end of the run, always, including when it
+suppressed nothing — suppressing silently would be the same failure in a
+new place:
+
+```
+$ python3 tools/mine.py --db path/to/fixture.db --min-projects 2 --ledger decisions.md
+1 candidate group(s) met the thresholds; showing 1
+
+group 1: 2 distinct project(s), 2 observation(s)
+  projects: repo-a, repo-c
+  ...
+
+---
+Read this before treating anything above as a finding: this is lexical
+grouping, not class identification.
+...
+
+ledger: decisions.md -- 1 decision(s) read, 1 group(s) suppressed
+  obs 6570,7523 -- rejected 2026-09-19: shared one generic word; unrelated documents
+  (matched on the observation ids, not on a group id: group ids are per-run)
+  ignored malformed ledger line 7: unknown decision 'rejcted' (expected one of: rejected, admitted, retired) -- '- 2026-09-19 | rejcted | miner group | obs: 101,102 | a typo, so this line decides nothing'
+```
+
+Suppression happens before ranking, so the group ids a run prints stay
+contiguous over the groups it actually shows — a run with `--ledger` and
+one without will number groups differently, which is one more reason the
+ledger is not keyed by them.
+
+`--ledger` works with `--draft` too. There, stdout is a pattern page and
+nothing else, so the ledger's own report goes to stderr instead of into the
+middle of the page. A `--ledger` path that does not exist is an error, not
+a quiet no-op: a ledger silently not read is precisely what this flag
+exists to prevent. `mine.py` never writes to the ledger — recording a
+decision is a human's job, and the draft it prints ends with the exact line
+to paste, with the ids already filled in.
 
 ## Troubleshooting
 
@@ -864,8 +1126,13 @@ python3 plugin/claude-code/scripts/tripwire.py --check
   is unset and nothing was ever created at the default `~/.precedent`. Run
   `--init`, or point one of those variables at a corpus you already have.
 - `exists: True` but `pages loaded: 0` — the directory exists but every
-  file in it either isn't `.md`, is `index.md`, or failed to parse. Check
-  the `skipped:` list `--check` prints underneath for the reason.
+  file in it either isn't `.md`, is a leftover `index.md` (never loaded, by
+  design), is retired, or failed to parse. Check the `retired on purpose:`
+  and `skipped as broken:` lists `--check` prints underneath: the first is
+  a decision someone made, the second is a mistake with the reason named.
+- A specific page never fires and `--check` lists it under `retired on
+  purpose:` — that is the `**Retired:**` line doing its job. Delete that
+  line to bring the page back.
 - Pages loaded, but a specific edit or command still doesn't trigger one —
   compare the glob against your path/command using the tables in
   [The two matchers](#the-two-matchers); a `**` that doesn't cross `/`, or a

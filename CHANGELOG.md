@@ -5,6 +5,65 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-19
+
+### Added
+
+- **Retirement, as a state of its own.** A page carrying a `**Retired:**`
+  line loads no triggers and can never fire again, and `--check` and
+  `--stats` report it under *retired on purpose* with its stated reason,
+  separately from a page *skipped as broken*. The two used to be one list,
+  and printed together a typo reads exactly like a decision. A wrapped
+  reason is read to the end of its paragraph rather than truncated at the
+  first line, because half a sentence still reads like a whole one.
+- **`--match --full`**, which prints the unstripped page for a human
+  checking what a page actually says.
+- **`injected_chars`** on every telemetry line: what the invocation really
+  put in front of the model, which `--stats` totals. Log lines written
+  before the field existed are counted apart rather than read as zero.
+- **`tools/mine.py --ledger <path>`**, and the append-only markdown format
+  it reads: one decision per line, `- <date> | rejected|admitted|retired |
+  <subject> | obs: <ids> | <why>`. It skips any candidate group whose
+  observation id set was already rejected, and says at the end of the run
+  how many it skipped and why — suppressing silently would be the same
+  failure in a new place. Keyed on observation ids because group ids are
+  assigned by rank within one run and persisted nowhere. A malformed line
+  is ignored, counted, and named with its reason. `--ledger` also applies
+  to `--draft` (its report goes to stderr, keeping stdout a clean page),
+  and every draft now ends with the ledger line for its own ids.
+
+### Changed
+
+- **A matching page no longer injects its evidence.** What reaches the
+  model is the page with its `## Evidence` section removed, and only that
+  section: what comes after it is injected like the rest. Evidence is what
+  a human needed in order to admit the page, not something the model acts
+  on while an edit is pending; it stays on disk for the human, for
+  `--match --full` and for the miner. Measured on real pages this removes
+  24-48% of a match.
+
+  Cutting from the heading to the end of the file was the first rule and it
+  was wrong: both pages written so far put their checklist *below* their
+  evidence, so it would have injected "what goes wrong" and dropped "what to
+  do about it". It would also have imposed a section order on page authors
+  without saying so, and an unstated layout constraint is one nobody
+  follows.
+- `--session-start` no longer tells someone with an all-retired corpus
+  that they have no pattern pages and should run `--init`. It surfaces
+  nothing either way, but one of those is a missing install and the other
+  is a decision.
+- `load_corpus()` now returns `(pages, retired, skipped)` and
+  `parse_page()` returns a fifth element, the retirement reason.
+
+### Removed
+
+- **The `patterns/index.md` concept.** The corpus needs no index file and
+  nothing ever read one: `--check` is the index, derived from the pages
+  themselves, so it cannot drift from them the way a hand-maintained list
+  does. The filename is still excluded from loading, so a leftover
+  `index.md` in an existing corpus is never suddenly parsed as a pattern
+  page, and `--check` now reports that it is present and unread.
+
 ## [0.5.0] - 2026-09-19
 
 ### Added
