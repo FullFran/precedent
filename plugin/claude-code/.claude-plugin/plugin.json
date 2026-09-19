@@ -1,0 +1,8 @@
+{
+  "name": "precedent",
+  "description": "Surfaces failure-class pattern pages from patterns/*.md before an Edit or Write touches a triggering path.",
+  "version": "0.3.0",
+  "author": {
+    "name": "FullFran"
+  }
+}
