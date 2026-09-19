@@ -56,13 +56,35 @@ script.
    ln -s /path/to/your/corpus ~/.precedent/patterns
    ```
    Otherwise set `PRECEDENT_PATTERNS`, or just run `--init` below and use the
-   default. Run `--check` afterwards: if it lists no pages, the hook will run,
-   exit 0 and do nothing, which looks exactly like having nothing to say.
+   default. You don't have to remember to check this yourself: a fresh
+   install announces itself once, at the start of your next session, if it
+   still has no corpus to read from. A working install stays silent.
 
 The corpus deliberately does **not** ship inside the plugin: a marketplace
 install copies only `plugin/claude-code/`, and your patterns are your own
 writing about your own work, not something a plugin install should own. See
 [DOCS.md](DOCS.md#configuration) for the full resolution order.
+
+### OpenCode
+
+`plugin/opencode/precedent.ts` is a second, weaker adapter for
+[OpenCode](https://opencode.ai) — see [Agent support](#agent-support) below
+for exactly how it's weaker before you rely on it.
+
+1. Copy or symlink it into `~/.config/opencode/plugins/`:
+   ```
+   ln -s /path/to/this/repo/plugin/opencode/precedent.ts \
+     ~/.config/opencode/plugins/precedent.ts
+   ```
+2. It needs `plugin/claude-code/scripts/tripwire.py` reachable — by default
+   it resolves the script relative to its own file (one directory up, into
+   `../claude-code/scripts/`), which is already true inside this repo. If
+   you copy the `.ts` file somewhere that path doesn't hold, set
+   `PRECEDENT_TRIPWIRE` to the script's absolute path.
+3. Verify it: make an edit that matches one of your corpus pages'
+   trigger paths (or run a matching `Bash` command), and check the pattern
+   was appended to the end of that tool call's result, delimited by a
+   `---` line naming `plugin/opencode/precedent.ts`.
 
 ## 60-second quickstart
 
@@ -129,6 +151,26 @@ invented, since it's the format example, not a real finding).
   the path and the command about to run.
 - **Not a search index.** Matching is deterministic glob matching against
   declared triggers, not ranking, embeddings or fuzzy retrieval.
+
+## Agent support
+
+All matching logic lives in one place —
+[`tripwire.py --match`](DOCS.md#--match) — so an adapter for another agent
+only has to shell out and place the result. Where the result lands, and when
+it arrives relative to the tool call it's about, differs per agent and is
+not cosmetic:
+
+| agent | hook point | when the pattern arrives | status |
+|---|---|---|---|
+| Claude Code | `PreToolUse` → `additionalContext` | before the edit | supported |
+| OpenCode | `tool.execute.after` → appended to the result | after the edit | supported, weaker |
+| Codex | hooks.json shape matches Claude Code's, but `PreToolUse` support is **unverified** | — | not implemented |
+| Pi | has a pre-tool `tool_call` event, but it can only block or mutate arguments, not inject context — see [DOCS.md](DOCS.md#agent-support) | — | not implemented |
+| any MCP agent | — | — | out of scope: this is a hook, not an MCP server, on purpose |
+
+See [DOCS.md](DOCS.md#agent-support) for what "weaker" costs on OpenCode,
+exactly what was checked for Codex and Pi, and why an MCP server is
+deliberately not offered.
 
 ## More
 

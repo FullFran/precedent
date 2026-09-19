@@ -1,5 +1,5 @@
 {
-  "description": "precedent tripwire — surfaces matching failure-class pattern pages before an Edit, Write or Bash call",
+  "description": "precedent tripwire \u2014 surfaces matching failure-class pattern pages before an Edit, Write or Bash call",
   "hooks": {
     "PreToolUse": [
       {
@@ -10,6 +10,18 @@
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/tripwire.py",
             "timeout": 5,
             "statusMessage": "Checking precedent..."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/tripwire.py --session-start",
+            "timeout": 5
           }
         ]
       }

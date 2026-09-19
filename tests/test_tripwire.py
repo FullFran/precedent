@@ -91,6 +91,44 @@ def run_check_subprocess(patterns_dir, env_overrides=None):
     return result
 
 
+def run_session_start_subprocess(patterns_dir, env_overrides=None):
+    env = dict(os.environ)
+    env["PRECEDENT_PATTERNS"] = str(patterns_dir)
+    if env_overrides:
+        env.update(env_overrides)
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--session-start"],
+        input="",
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    return result
+
+
+def run_match_subprocess(args, patterns_dir=None, precedent_home=None, env_overrides=None):
+    """Invoke the script as a real subprocess in --match mode."""
+    env = dict(os.environ)
+    if patterns_dir is not None:
+        env["PRECEDENT_PATTERNS"] = str(patterns_dir)
+    if precedent_home is not None:
+        env["PRECEDENT_HOME"] = str(precedent_home)
+    if env_overrides:
+        env.update(env_overrides)
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--match"] + args,
+        input="",
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    return result
+
+
 def run_init_subprocess(precedent_home, patterns_dir=None, env_overrides=None):
     env = dict(os.environ)
     env["PRECEDENT_HOME"] = str(precedent_home)
@@ -764,6 +802,61 @@ class TestCheckMode(unittest.TestCase):
         self.assertIn("(none)", result.stdout)  # gate.md has no command globs
 
 
+class TestSessionStartMode(unittest.TestCase):
+    """--session-start (the SessionStart hook). See run_session_start()'s
+    docstring: plain stdout from SessionStart DOES reach the model, so a
+    healthy install (a corpus with at least one usable page) must print
+    nothing at all, and only an install with nothing to surface prints its
+    one notice."""
+
+    def test_corpus_with_a_page_produces_no_output_at_all(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            result = run_session_start_subprocess(patterns_dir=patterns_dir)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_missing_corpus_directory_prints_notice_naming_it(self):
+        with tempfile.TemporaryDirectory() as home:
+            missing = Path(home) / "nonexistent" / "patterns"
+            result = run_session_start_subprocess(patterns_dir=missing)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(str(missing), result.stdout)
+
+    def test_corpus_with_no_usable_pages_also_prints_notice(self):
+        # A single page with no trigger line is loaded by nothing: as far as
+        # the hook is concerned this is as silent as a missing corpus, so it
+        # gets the same notice.
+        with TempCorpus({"no-trigger.md": NO_TRIGGER_PAGE}) as patterns_dir:
+            result = run_session_start_subprocess(patterns_dir=patterns_dir)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(str(patterns_dir), result.stdout)
+
+    def test_notice_mentions_init_and_precedent_patterns(self):
+        with tempfile.TemporaryDirectory() as home:
+            missing = Path(home) / "nonexistent" / "patterns"
+            result = run_session_start_subprocess(patterns_dir=missing)
+
+        self.assertIn("--init", result.stdout)
+        self.assertIn("PRECEDENT_PATTERNS", result.stdout)
+
+    def test_unreadable_corpus_directory_exits_zero_and_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as home:
+            patterns_dir = Path(home) / "patterns"
+            patterns_dir.mkdir()
+            (patterns_dir / "gate.md").write_text(GATE_PAGE, encoding="utf-8")
+            os.chmod(patterns_dir, 0o000)
+            try:
+                result = run_session_start_subprocess(patterns_dir=patterns_dir)
+            finally:
+                os.chmod(patterns_dir, 0o700)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+
+
 class TestDefaultCorpusResolution(unittest.TestCase):
     """get_patterns_dir()'s resolution order. Every other test in this file
     sets PRECEDENT_PATTERNS explicitly, so this is the only coverage of what
@@ -883,6 +976,137 @@ class TestInitMode(unittest.TestCase):
         self.assertIn("PRECEDENT_PATTERNS", result.stdout)
 
 
+class TestMatchMode(unittest.TestCase):
+    """--match: the transport-neutral match mode other agents' adapters
+    shell out to, instead of reimplementing matching themselves."""
+
+    def test_match_path_hit_prints_raw_page_no_envelope(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--path", "Makefile"], patterns_dir=patterns_dir, precedent_home=home
+                )
+
+        self.assertEqual(result.returncode, 0)
+        # No hookSpecificOutput envelope -- just the page's raw markdown.
+        self.assertEqual(result.stdout, GATE_PAGE)
+        self.assertNotIn("hookSpecificOutput", result.stdout)
+
+    def test_match_command_hit_prints_raw_page(self):
+        with TempCorpus({"shell.md": COMMAND_ONLY_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                command = 'gh issue comment --body "see `owner/repo#1`"'
+                result = run_match_subprocess(
+                    ["--command", command], patterns_dir=patterns_dir, precedent_home=home
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, COMMAND_ONLY_PAGE)
+
+    def test_match_path_no_match_prints_nothing(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--path", "src/unrelated.py"], patterns_dir=patterns_dir, precedent_home=home
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_match_command_no_match_prints_nothing(self):
+        with TempCorpus({"shell.md": COMMAND_ONLY_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--command", "ls -la"], patterns_dir=patterns_dir, precedent_home=home
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_match_agent_lands_in_log(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_match_subprocess(
+                    ["--path", "Makefile", "--agent", "opencode"],
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+                entry = json.loads((Path(home) / "tripwire.jsonl").read_text("utf-8").strip())
+
+        self.assertEqual(entry["agent"], "opencode")
+        self.assertEqual(entry["kind"], "path")
+        self.assertEqual(entry["subject"], "Makefile")
+
+    def test_match_default_agent_is_claude_code(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_match_subprocess(
+                    ["--path", "Makefile"], patterns_dir=patterns_dir, precedent_home=home
+                )
+                entry = json.loads((Path(home) / "tripwire.jsonl").read_text("utf-8").strip())
+
+        self.assertEqual(entry["agent"], "claude-code")
+
+    def test_match_command_agent_redacts_secret_same_as_hook_mode(self):
+        command = "TOKEN=sk-LEAKED gh issue comment --body 'x'"
+        with TempCorpus({"shell.md": COMMAND_ONLY_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_match_subprocess(
+                    ["--command", command, "--agent", "opencode"],
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+                raw = (Path(home) / "tripwire.jsonl").read_text("utf-8")
+
+        entry = json.loads(raw.strip())
+        self.assertEqual(entry["agent"], "opencode")
+        self.assertEqual(entry["subject"], "(redacted)")
+        for needle in ("TOKEN", "sk-LEAKED"):
+            self.assertNotIn(needle, raw)
+
+    def test_match_neither_path_nor_command_exits_zero(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--agent", "opencode"], patterns_dir=patterns_dir, precedent_home=home
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_match_both_path_and_command_exits_zero(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--path", "Makefile", "--command", "ls -la"],
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_match_dangling_flag_with_no_value_exits_zero(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--path"], patterns_dir=patterns_dir, precedent_home=home
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_match_unrecognised_flag_exits_zero(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                result = run_match_subprocess(
+                    ["--nonsense", "value"], patterns_dir=patterns_dir, precedent_home=home
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+
 class TestStatsMode(unittest.TestCase):
     def test_missing_log_prints_plain_sentence(self):
         with tempfile.TemporaryDirectory() as home:
@@ -962,6 +1186,44 @@ class TestStatsMode(unittest.TestCase):
         self.assertIn("A gate that cannot fail", result.stdout)
         self.assertIn("Backticks execute in a shell body", result.stdout)
         self.assertIn("Makefile", result.stdout)
+
+    def test_stats_breaks_down_by_agent_when_more_than_one_appears(self):
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                # One claude-code invocation (the default, via hook mode)...
+                run_hook_subprocess(
+                    edit_payload("Makefile"), patterns_dir=patterns_dir, precedent_home=home
+                )
+                # ...and two opencode invocations, via --match.
+                run_match_subprocess(
+                    ["--path", "Makefile", "--agent", "opencode"],
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+                run_match_subprocess(
+                    ["--path", "src/unrelated.py", "--agent", "opencode"],
+                    patterns_dir=patterns_dir,
+                    precedent_home=home,
+                )
+                result = run_stats_subprocess(precedent_home=home, patterns_dir=patterns_dir)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("invocations: 3", result.stdout)
+        self.assertIn("by agent: claude-code=1 opencode=2", result.stdout)
+
+    def test_stats_stays_unchanged_when_only_one_agent_appears(self):
+        # Every existing install only ever has one agent (claude-code, via
+        # the PreToolUse hook) in its log. --stats must read exactly as it
+        # did before the agent field existed: no "by agent:" line at all.
+        with TempCorpus({"gate.md": GATE_PAGE}) as patterns_dir:
+            with tempfile.TemporaryDirectory() as home:
+                run_hook_subprocess(
+                    edit_payload("Makefile"), patterns_dir=patterns_dir, precedent_home=home
+                )
+                result = run_stats_subprocess(precedent_home=home, patterns_dir=patterns_dir)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("by agent:", result.stdout)
 
 
 if __name__ == "__main__":

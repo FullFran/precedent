@@ -5,6 +5,58 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-19
+
+### Added
+
+- **OpenCode support**, through `plugin/opencode/precedent.ts`. It is weaker
+  than the Claude Code integration and the docs say so rather than claiming
+  parity: OpenCode's `tool.execute.before` can read or mutate a tool's
+  arguments and can abort the call by throwing, but it has no field for
+  injecting context, so the adapter uses `tool.execute.after` and appends the
+  matching page to the tool result. The pattern therefore arrives **after**
+  the edit, in time for the agent's next action rather than before the one it
+  is about.
+- `--match --path` / `--match --command`: a transport-neutral mode that
+  answers the matching question and prints the page, so an adapter for
+  another agent does not reimplement matching. The `PreToolUse` hook mode now
+  calls the same internal function.
+- `--agent <name>`, recorded on every log entry, so `--stats` can break
+  results down when more than one agent is firing.
+- `--version`, read from the plugin manifest rather than a constant, because
+  two declarations of the same fact drift.
+
+### Documentation
+
+- An agent support matrix in both `README.md` and `DOCS.md`, stating for each
+  agent where it hooks, when the pattern arrives, and what was actually
+  checked. Codex's hook file shape matches Claude Code's but no `PreToolUse`
+  example or enumerated event list was found, so it is listed as unverified
+  rather than guessed either way. Pi has a pre-tool `tool_call` event that can
+  block or mutate arguments but not inject context, plus a `tool_result` event
+  that can modify what the model reads, so an adapter shaped like the OpenCode
+  one is feasible and the docs point at where to start.
+- Why no MCP server is offered: it would add tools and always-on tokens, and
+  it would turn surfacing into a pull the agent has to remember to perform,
+  which is the failure this tool exists to prevent.
+
+## [0.4.0] - 2026-09-19
+
+### Added
+
+- `--session-start`: a new `tripwire.py` mode, wired as a `SessionStart`
+  hook (matcher `startup|clear`) in
+  `plugin/claude-code/hooks/hooks.json`. Installing the plugin and pointing
+  it at a corpus are two separate steps, and a missing second step used to
+  produce an install indistinguishable from a working-but-quiet one — the
+  `PreToolUse` hook ran on every edit, found no pages, exited 0 and said
+  nothing. `--session-start` runs once per session and prints one paragraph,
+  naming the corpus directory and how to fix it (`--init` or
+  `PRECEDENT_PATTERNS`), only when there is nothing to surface. When a
+  corpus with at least one usable page is loaded, it prints nothing at all:
+  plain stdout from `SessionStart` reaches the model, unlike `PreToolUse`,
+  so a healthy install still costs zero tokens.
+
 ## [0.3.0] - 2026-09-19
 
 First release.

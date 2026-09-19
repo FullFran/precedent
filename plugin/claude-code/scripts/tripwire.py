@@ -23,6 +23,12 @@ Usage:
     tripwire.py            hook mode (default): reads the hook JSON payload
                             from stdin, prints hookSpecificOutput JSON on a
                             match, prints nothing on a miss.
+    tripwire.py --match --path <path>       transport-neutral match mode:
+    tripwire.py --match --command <command> answers the matching question
+                            directly (no hookSpecificOutput envelope), for
+                            an adapter belonging to an agent other than
+                            Claude Code. Takes an optional --agent <name>
+                            (default "claude-code"), recorded in the log.
     tripwire.py --stats     reads the telemetry log back and prints a report.
     tripwire.py --check     reports what corpus is loaded and each page's
                             trigger globs, of both kinds.
@@ -357,7 +363,7 @@ def command_log_subject(command):
     return " ".join(kept)
 
 
-def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir):
+def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir, agent="claude-code"):
     """Append one JSONL line for this invocation. Best effort, never raises.
 
     `subject` is what was checked: a file path for kind "path", or a
@@ -375,6 +381,11 @@ def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir):
     directory does not travel with it and PRECEDENT_PATTERNS has to say
     where it lives. When that is unset the hook runs, exits 0 and does
     nothing, which is the exact failure this corpus exists to document.
+
+    `agent` names who fired this invocation: "claude-code" for the
+    PreToolUse hook (the default, for every existing call site), or
+    whatever another agent's own adapter passes through --match --agent.
+    It lets --stats tell them apart once more than one shows up in the log.
     """
     try:
         log_path = get_log_path()
@@ -387,6 +398,7 @@ def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir):
             "count": len(matched_titles),
             "pages": pages_loaded,
             "corpus": str(corpus_dir),
+            "agent": agent,
         }
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
@@ -395,19 +407,56 @@ def log_event(subject, kind, matched_titles, pages_loaded, corpus_dir):
 
 
 # ---------------------------------------------------------------------------
+# Shared matching + logging, used by both hook mode and --match mode
+# ---------------------------------------------------------------------------
+
+def _match_and_log(kind, subject, agent):
+    """Load the corpus, match `subject` against it by `kind` ("path" or
+    "command"), log the invocation, and return the matched pages.
+
+    This is the one place matching + logging happens. Hook mode and --match
+    mode both call it so there is exactly one matching path for both: a
+    transport-neutral adapter (see DOCS.md) gets the same behavior the
+    PreToolUse hook has always had, including the command redaction rule.
+    """
+    patterns_dir = get_patterns_dir()
+    pages, _skipped = load_corpus(patterns_dir)
+
+    if kind == "path":
+        matched = match_path_pages(pages, subject)
+        log_subject = subject
+    else:
+        matched = match_command_pages(pages, subject)
+        log_subject = command_log_subject(subject)
+
+    titles = [p.title for p in matched]
+    log_event(log_subject, kind, titles, len(pages), patterns_dir, agent)
+    return matched
+
+
+def _matched_text(matched):
+    """Every matched page's full raw text, joined with a blank line between
+    pages -- exactly as additionalContext carries it. None on no match."""
+    if not matched:
+        return None
+    return "\n\n".join(p.content for p in matched)
+
+
+# ---------------------------------------------------------------------------
 # Hook mode
 # ---------------------------------------------------------------------------
 
 def _emit(matched):
-    if matched:
-        context = "\n\n".join(p.content for p in matched)
-        output = {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "additionalContext": context,
-            }
+    text = _matched_text(matched)
+    if text is None:
+        return
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": text,
         }
-        sys.stdout.write(json.dumps(output, separators=(",", ":")))
+    }
+    sys.stdout.write(json.dumps(output, separators=(",", ":")))
 
 
 def run_hook():
@@ -431,12 +480,7 @@ def run_hook():
         if not isinstance(file_path, str) or not file_path:
             return
 
-        patterns_dir = get_patterns_dir()
-        pages, _skipped = load_corpus(patterns_dir)
-        matched = match_path_pages(pages, file_path)
-        titles = [p.title for p in matched]
-
-        log_event(file_path, "path", titles, len(pages), patterns_dir)
+        matched = _match_and_log("path", file_path, "claude-code")
         _emit(matched)
 
     elif tool_name == "Bash":
@@ -444,18 +488,76 @@ def run_hook():
         if not isinstance(command, str) or not command:
             return
 
-        patterns_dir = get_patterns_dir()
-        pages, _skipped = load_corpus(patterns_dir)
-        matched = match_command_pages(pages, command)
-        titles = [p.title for p in matched]
-
-        log_event(command_log_subject(command), "command", titles, len(pages), patterns_dir)
+        matched = _match_and_log("command", command, "claude-code")
         _emit(matched)
 
     # Any other tool_name (or none at all): do nothing. Nothing in this
     # corpus is triggered by any tool other than Edit, Write and Bash, and
     # a hook that does not recognise the invocation should stay silent
     # rather than guess.
+
+
+# ---------------------------------------------------------------------------
+# --match mode
+# ---------------------------------------------------------------------------
+
+def run_match():
+    """tripwire.py --match --path <path> | --match --command <command>
+
+    Transport-neutral match mode: answers the matching question directly,
+    with no hookSpecificOutput envelope, so another agent's own adapter
+    (e.g. plugin/opencode/precedent.ts) does not have to reimplement
+    matching. Prints matching pages' markdown, joined by a blank line,
+    exactly as additionalContext carries it today, or nothing on no match.
+
+    Exactly one of --path or --command is required; neither, or both, is a
+    malformed invocation and produces no output and no log entry -- caught
+    the same way a missing file_path/command is caught in hook mode.
+
+    --agent <name> is recorded in the log entry as "agent" (default
+    "claude-code"), so --stats can tell which agent fired a given line.
+
+    Always exits 0, same as every other mode (see main()): this can be
+    invoked from inside another agent's own process rather than as a
+    subprocess, so it must never raise or block that process either.
+    """
+    argv = sys.argv[2:]
+    path = None
+    command = None
+    agent = "claude-code"
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--path" and i + 1 < len(argv):
+            path = argv[i + 1]
+            i += 2
+        elif arg == "--command" and i + 1 < len(argv):
+            command = argv[i + 1]
+            i += 2
+        elif arg == "--agent" and i + 1 < len(argv):
+            agent = argv[i + 1]
+            i += 2
+        else:
+            # An unrecognised flag, or a flag with no value: malformed.
+            return
+
+    # Exactly one of --path / --command is required.
+    if (path is None) == (command is None):
+        return
+
+    if path is not None:
+        if not path:
+            return
+        matched = _match_and_log("path", path, agent)
+    else:
+        if not command:
+            return
+        matched = _match_and_log("command", command, agent)
+
+    text = _matched_text(matched)
+    if text is not None:
+        sys.stdout.write(text)
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +635,49 @@ def run_init():
     print("  trusting it. Then run --check.")
 
 
+def run_session_start():
+    """Say once, at session start, when there is nothing to surface.
+
+    Installing the plugin and pointing it at a corpus are two steps, and the
+    second one is easy to miss. Without this, a fresh install is indis-
+    tinguishable from a working one that happens to be quiet: the hook runs on
+    every edit, finds no pages, exits 0 and says nothing. That is the exact
+    failure this corpus exists to document, so the tool must not ship it.
+
+    Plain stdout from SessionStart DOES reach the model, unlike PreToolUse, so
+    this prints nothing at all when a corpus is loaded. A healthy install is
+    silent and costs nothing.
+    """
+    patterns_dir = get_patterns_dir()
+    try:
+        pages, _skipped = load_corpus(patterns_dir)
+    except Exception:
+        return
+    if pages:
+        return
+
+    print("precedent is installed but has no pattern pages, so it will not "
+          "surface anything. Looked in {}. Run the tripwire with --init to "
+          "create a corpus there with a page to start from, or set "
+          "PRECEDENT_PATTERNS to a corpus you already keep.".format(patterns_dir))
+
+
+def run_version():
+    """Print the version, read from the plugin manifest rather than a constant.
+
+    A version hardcoded here is a second place to update, and two declarations
+    of the same fact drift. The manifest is the one the plugin host reads, so
+    it is the one that is true. If it cannot be read, say so rather than
+    printing a number that might be wrong.
+    """
+    manifest = Path(__file__).resolve().parents[1] / ".claude-plugin" / "plugin.json"
+    try:
+        with open(manifest, "r", encoding="utf-8") as fh:
+            print("precedent {}".format(json.load(fh)["version"]))
+    except Exception:
+        print("precedent (version unknown: could not read {})".format(manifest))
+
+
 def run_check():
     """Say out loud where the corpus is and what loaded, so a broken install
     is visible in one command instead of showing up as silence."""
@@ -598,6 +743,14 @@ def _entry_subject(entry):
     return subject
 
 
+def _entry_agent(entry):
+    # Log lines written before --match existed carry no "agent" field at
+    # all; every one of them came from the claude-code PreToolUse hook, so
+    # that is the correct default, not a guess.
+    agent = entry.get("agent")
+    return agent if isinstance(agent, str) and agent else "claude-code"
+
+
 def run_stats():
     log_path = get_log_path()
 
@@ -615,6 +768,7 @@ def run_stats():
     hit_subject_freq = {"path": {}, "command": {}}
     miss_subject_freq = {"path": {}, "command": {}}
     kind_totals = {"path": 0, "command": 0}
+    agent_totals = {}
     blind = 0
     blind_corpora = {}
 
@@ -639,8 +793,10 @@ def run_stats():
 
             kind = _entry_kind(entry)
             subject = _entry_subject(entry)
+            agent = _entry_agent(entry)
             matched = entry.get("matched") or []
             kind_totals[kind] = kind_totals.get(kind, 0) + 1
+            agent_totals[agent] = agent_totals.get(agent, 0) + 1
 
             # An entry written with no corpus loaded is not a miss. It means
             # the hook ran against nothing, and counting it as a miss would
@@ -690,6 +846,17 @@ def run_stats():
             kind_totals.get("path", 0), kind_totals.get("command", 0)
         )
     )
+    # Only worth a line once more than one agent shows up in the log; a
+    # single-agent install (every existing one, before --match existed)
+    # stays exactly as it read before this field existed.
+    if len(agent_totals) > 1:
+        print(
+            "  by agent: {}".format(
+                " ".join(
+                    "{}={}".format(a, n) for a, n in sorted(agent_totals.items())
+                )
+            )
+        )
     if blind:
         print("  ran without a corpus: {}".format(blind))
     print("  hits: {}".format(hits))
@@ -731,6 +898,12 @@ def main():
             run_check()
         elif len(sys.argv) > 1 and sys.argv[1] == "--init":
             run_init()
+        elif len(sys.argv) > 1 and sys.argv[1] == "--session-start":
+            run_session_start()
+        elif len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+            run_version()
+        elif len(sys.argv) > 1 and sys.argv[1] == "--match":
+            run_match()
         else:
             run_hook()
     except Exception:

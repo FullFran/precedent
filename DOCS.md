@@ -11,6 +11,7 @@ miner. For the pitch and a quickstart, see [README.md](README.md).
 - [Configuration](#configuration)
 - [CLI modes](#cli-modes)
 - [Telemetry](#telemetry)
+- [Agent support](#agent-support)
 - [`tools/mine.py`](#toolsminepy)
 - [Troubleshooting](#troubleshooting)
 
@@ -127,9 +128,11 @@ match the whole command string.
 
 ## The hook contract
 
-`precedent` is registered as a `PreToolUse` hook (see
-`plugin/claude-code/hooks/hooks.json`), invoked by absolute path through
-`${CLAUDE_PLUGIN_ROOT}` for `Edit`, `Write` and `Bash` tool calls.
+`precedent` registers two hooks (see `plugin/claude-code/hooks/hooks.json`),
+both invoked by absolute path through `${CLAUDE_PLUGIN_ROOT}`: a
+`PreToolUse` hook for `Edit`, `Write` and `Bash` tool calls (default/hook
+mode, no flag), and a `SessionStart` hook, matcher `startup|clear`, that runs
+`tripwire.py --session-start` (see [`--session-start`](#--session-start)).
 
 **Input:** the hook JSON payload on stdin, e.g.
 `{"tool_name": "Edit", "tool_input": {"file_path": "..."}}` or
@@ -145,7 +148,7 @@ non-object payload, a missing `tool_input`, or a missing/empty
 
 `additionalContext` is every matching page's full raw text, joined with a
 blank line between pages. This exact shape is required, and it is the
-*only* shape that reaches the model:
+*only* shape that reaches the model **from a `PreToolUse` hook**:
 
 - Plain stdout from a `PreToolUse` hook reaches only a debug log.
 - A top-level `systemMessage` field reaches only the user's own transcript.
@@ -153,6 +156,17 @@ blank line between pages. This exact shape is required, and it is the
   is read into the model's context.
 
 **Output, on a miss:** nothing at all is written to stdout.
+
+That rule is specific to `PreToolUse`, and does not generalize. A handful of
+other hook events — `UserPromptSubmit`, `UserPromptExpansion`,
+`SessionStart`, and `PostModelSwitch` — read **plain stdout** into the
+model's context directly, with no `hookSpecificOutput` wrapper needed. That
+is exactly why `--session-start` prints nothing on a healthy install: for
+`PreToolUse`, silence on stdout is the null case regardless — nothing there
+was ever going to be read. For `SessionStart`, silence is a deliberate
+choice — anything printed is read on every single session, so a chatty hook
+would spend context for no reason, and printing only costs something when
+there is a genuine problem to report.
 
 **Exit code: always 0.** This is the safety contract the whole script is
 built around, stated directly in its module docstring: *"this script must
@@ -163,7 +177,8 @@ swallowed silently rather than blocking or slowing down an edit or a
 command. `main()` wraps every mode in a bare `try/except Exception: pass`
 followed by an unconditional `sys.exit(0)`; there is no `set -e` equivalent
 here, on purpose, because exit 2 from this hook would deny the tool call it
-was supposed to be informing.
+was supposed to be informing. The same wrapper covers `--session-start`, so
+a `SessionStart` invocation exits 0 no matter what it finds.
 
 ## Configuration
 
@@ -230,6 +245,93 @@ $ echo '{"tool_name":"Bash","tool_input":{"command":"gh issue comment --body \"s
     | python3 plugin/claude-code/scripts/tripwire.py
 {"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"# Backticks execute in a shell body\n\n**Trigger:** you are running gh with a body argument.\n\n**Trigger command:** `gh * --body*` `gh * --body-file*`\n\n**Class:** bash executes backticks in command text instead of passing it through.\n"}}
 ```
+
+### `--match`
+
+```
+tripwire.py --match --path <path>
+tripwire.py --match --command <command>
+```
+
+A transport-neutral match mode: it answers the matching question directly,
+with no `hookSpecificOutput` envelope, so an adapter belonging to an agent
+other than Claude Code (see [Agent support](#agent-support)) doesn't have to
+reimplement matching, only shell out and place the result. It shares the
+same internal matching function hook mode uses — there is exactly one
+matching path in this script, not two that could drift apart.
+
+Exactly one of `--path` or `--command` is required. An optional `--agent
+<name>` (default `claude-code`) is recorded in the log entry as `agent`, so
+[`--stats`](#--stats) can tell which agent fired a given line.
+
+Prints every matching page's markdown, joined by a blank line — exactly what
+`additionalContext` carries in hook mode, just without the JSON wrapper —
+or nothing at all on no match:
+
+```
+$ python3 plugin/claude-code/scripts/tripwire.py --match --path Makefile
+# A gate that cannot fail
+
+**Trigger:** you are adding, changing, or relying on CI, a test runner, a
+lint or format check, or any automated gate.
+
+**Trigger paths:** `.github/workflows/**` `**/Makefile`
+
+**Class:** the check reports success without having checked.
+
+## What goes wrong
+
+A gate is added, it goes green, and everyone reads green as evidence. But the
+gate never ran, or ran against nothing, or its exit status was swallowed on
+the way out. The failure is silent by construction: a gate that cannot fail
+looks exactly like a gate that passes.
+
+## Evidence
+
+Replace this section with your own, verbatim. Two independent occurrences in
+different places, quoted from commits, issues or logs. A claim nobody can
+check is not evidence, and a page admitted without it is just an opinion that
+fires on every edit.
+
+## Check before you trust a gate
+
+- Make it fail on purpose, once, and watch it go red. A gate never observed
+  failing is not yet a gate.
+- Check the exit status survives the whole pipeline. A pipe, a `tail`, a
+  `|| true` or a trailing command replaces it.
+- Count what ran. A runner that discovers work can discover nothing and still
+  exit 0; assert the count is non-zero.
+
+$ python3 plugin/claude-code/scripts/tripwire.py --match --path src/unrelated.py
+$
+```
+
+A command match, with `--agent` set the way `plugin/opencode/precedent.ts`
+sets it:
+
+```
+$ python3 plugin/claude-code/scripts/tripwire.py --match \
+    --command 'gh issue comment --body "see it"' --agent opencode
+# Backticks execute in a shell body
+
+**Trigger:** you are running gh with a body argument.
+
+**Trigger command:** `gh * --body*` `gh * --body-file*`
+
+**Class:** bash executes backticks in command text instead of passing it through.
+```
+
+That last invocation's log line carries the agent through, and the command
+subject is still redacted to its leading words the same way hook mode
+redacts it:
+
+```
+{"ts": "2026-09-19T17:05:35Z", "kind": "command", "subject": "gh issue comment", "matched": ["Backticks execute in a shell body"], "count": 1, "pages": 2, "corpus": ".precedent/patterns", "agent": "opencode"}
+```
+
+Neither `--path` nor `--command`, or both at once, is a malformed
+invocation: it prints nothing, logs nothing, and — like every other mode —
+still exits 0.
 
 ### `--init`
 
@@ -313,6 +415,40 @@ actually resolved from `PRECEDENT_HOME`/`~/.precedent`, not from the
 script's own directory; nothing is ever read relative to the script (see
 [Configuration](#configuration)).
 
+### `--session-start`
+
+Registered as a `SessionStart` hook (matcher `startup|clear`, see
+`plugin/claude-code/hooks/hooks.json`), so it runs once when a session starts
+or is cleared — not on every edit. Its job is to make a corpus-less install
+visible without anyone having to remember to run `--check`: installing the
+plugin and pointing it at a corpus are two separate steps, and a missing
+second step otherwise produces an install indistinguishable from a
+working-but-quiet one. When the corpus has at least one usable page, it
+prints **nothing at all**:
+
+```
+$ PRECEDENT_HOME=.precedent python3 plugin/claude-code/scripts/tripwire.py --session-start
+$
+```
+
+It prints nothing on purpose, not because there is nothing to say. Unlike
+`PreToolUse`, plain stdout from a `SessionStart` hook reaches the model (see
+[The hook contract](#the-hook-contract)) — a chatty hook here would spend
+context on every single session for no reason, so a healthy install has to
+stay silent. When the corpus is missing or holds no usable pages, it prints
+one paragraph naming the directory it looked in and exactly how to fix it:
+
+```
+$ PRECEDENT_HOME=.precedent python3 plugin/claude-code/scripts/tripwire.py --session-start
+precedent is installed but has no pattern pages, so it will not surface anything. Looked in .precedent/patterns. Run the tripwire with --init to create a corpus there with a page to start from, or set PRECEDENT_PATTERNS to a corpus you already keep.
+```
+
+An unusable corpus (every page fails to parse) is treated the same as a
+missing one — both mean the hook has nothing to surface, so both get the
+notice. Like every other mode, it always exits 0: an unreadable corpus
+directory is swallowed the same way `load_corpus()` swallows it everywhere
+else, and never raises.
+
 ### `--stats`
 
 Reads the telemetry log back and reports hits, misses, and a breakdown by
@@ -349,6 +485,27 @@ subjects that did not match, by frequency:
 
 corpus pages skipped:
   (none)
+```
+
+`by agent:` only appears once more than one agent shows up in the log — a
+single-agent install (every install that predates
+[`--match`](#--match), and every install that only ever uses the Claude
+Code hook) reads exactly as it always has. Once a second agent's adapter
+(e.g. `plugin/opencode/precedent.ts`, which logs as `opencode`) has fired at
+least once, the line appears:
+
+```
+$ python3 plugin/claude-code/scripts/tripwire.py --stats
+precedent tripwire stats
+  log: .precedent/tripwire.jsonl
+  invocations: 3
+  by kind: path=2 command=1
+  by agent: claude-code=2 opencode=1
+  hits: 2
+  misses: 1
+  hit rate: 66.7%
+  span: 2026-09-19T17:05:35Z .. 2026-09-19T17:05:35Z
+  ...
 ```
 
 If invocations ran with **no corpus loaded at all** (`pages == 0` in the log
@@ -399,13 +556,16 @@ never affected by whether the log write succeeded.
 | `count` | integer | `len(matched)`. |
 | `pages` | integer | How many pattern pages were loaded for this invocation. `0` means the hook ran against an empty or missing corpus — see the blind-run warning under [`--stats`](#--stats). |
 | `corpus` | string | The resolved corpus directory path for this invocation. |
+| `agent` | string | Who fired this invocation: `"claude-code"` for the `PreToolUse` hook, or whatever another agent's adapter passed to [`--match --agent`](#--match) (`"opencode"` for `plugin/opencode/precedent.ts`). |
 
 Older log lines, written before command triggers existed, carry `path`
 instead of `subject` and have no `kind` field at all. `--stats` reads both:
 a missing `kind` is treated as `"path"` (every log line from before command
 triggers existed came from a path match), and `subject` falls back to the
-legacy `path` field when absent. `tripwire.jsonl` is meant to accumulate
-across format changes without breaking `--stats`.
+legacy `path` field when absent. Older log lines also predate `agent`
+entirely — `--stats` treats a missing `agent` as `"claude-code"`, since
+every one of them came from the hook before `--match` existed. `tripwire.jsonl`
+is meant to accumulate across format changes without breaking `--stats`.
 
 ### The redaction rule
 
@@ -440,6 +600,142 @@ survive, the subject is logged as the literal string `"(redacted)"`.
 
 What survives is enough to answer the question the log exists for — is a
 command glob too narrow, or too wide — and nothing more.
+
+## Agent support
+
+All matching lives in one place: [`tripwire.py --match`](#--match). An
+adapter for another agent's hook surface shells out to it and places the
+result somewhere the model will read it — it never reimplements page
+parsing or glob matching itself. What differs per agent is *where* that
+placement is possible at all, and that difference is not cosmetic.
+
+| agent | hook point | when the pattern arrives | status |
+|---|---|---|---|
+| Claude Code | `PreToolUse` → `additionalContext` | before the edit | supported |
+| OpenCode | `tool.execute.after` → appended to the result | after the edit | supported, weaker |
+| Codex | hooks.json shape matches Claude Code's, but `PreToolUse` support is **unverified** | — | not implemented |
+| Pi | has a pre-tool `tool_call` event, but it can only block or mutate arguments, not inject context | — | not implemented |
+| any MCP agent | — | — | out of scope, on purpose |
+
+### Claude Code — supported
+
+The baseline this whole tool is built around: see
+[The hook contract](#the-hook-contract). `additionalContext` from a
+`PreToolUse` hook is read into the model's context *before* the `Edit`,
+`Write` or `Bash` call it was invoked for runs. The model sees the page and
+can still decide not to make the mistake in the first place.
+
+### OpenCode — supported, weaker
+
+`plugin/opencode/precedent.ts` uses OpenCode's `tool.execute.after` hook,
+and only that one. This was not a stylistic choice — it's the only hook
+OpenCode exposes that can put text in front of the model at all:
+
+- `"tool.execute.before"(input: {tool, sessionID, callID}, output: {args})`
+  → the only mutable thing is `output.args`, the tool's own arguments.
+  There is no field here to inject context for the model to read, and
+  throwing aborts the tool call outright rather than informing it. This is
+  the hook that would need to exist for OpenCode to get Claude Code's
+  before-the-edit behavior, and it doesn't have the shape for it.
+- `"tool.execute.after"(input: {tool, sessionID, callID, args}, output:
+  {title, output, metadata})` → `output.output` is the tool result string
+  the model actually reads, and it's mutable. This is where
+  `plugin/opencode/precedent.ts` appends the matched page, clearly
+  delimited so it's never mistaken for the tool's own output.
+
+The consequence: on OpenCode, the pattern page arrives *after* the edit (or
+the command) has already run, attached to that same tool call's result. The
+model reads it before its *next* action, so it can still course-correct —
+but the edit that would have been prevented on Claude Code has already
+landed by the time the model sees the page. That's a real difference in
+what the tool can do for you, not a detail. Don't treat OpenCode's adapter
+as equivalent to Claude Code's; treat it as a weaker net.
+
+Tool names: OpenCode's built-ins are registered under lowercase ids —
+`edit`, `write`, `bash` — not Claude Code's capitalized `Edit`/`Write`/
+`Bash`. This was verified two ways, not guessed by analogy: against the
+installed `@opencode-ai/plugin` type definitions (`Hooks["tool.execute.after"]`'s
+`input.tool: string`, and the existing OpenCode plugins already installed
+locally that canonicalize tool names with `.toLowerCase()` before comparing
+them), and directly against the compiled `opencode` binary itself, which
+contains the literal registrations `ID="bash"` / `H.register({[ID]: ...})`,
+`rP="edit"` / `H.register({[rP]: ...})`, and `DN="write"` /
+`H.register({[DN]: ...})`.
+
+### Codex — not implemented, unverified
+
+What was checked: a real, locally installed Codex CLI, its `codex plugin`
+subcommand, and the two actual third-party Codex plugins with a
+`hooks.json` present in a local plugin cache. Both use the exact same
+`{"hooks": {"<Event>": [{"matcher": "...", "hooks": [{"type": "command",
+"command": "..."}]}]}}` shape Claude Code's `hooks.json` uses, with the
+same tool matcher strings (`"Write|Edit"`, `"Bash"`) — but both only
+registered `PostToolUse` and `Stop` handlers. Neither used `PreToolUse`.
+Codex's own bundled plugin authoring reference documents the plugin
+manifest's `hooks` field only as "Hook config path" — it points at
+`hooks.json` without enumerating which event names Codex actually
+recognizes or dispatches.
+
+So "unverified" means exactly that: the file *shape* Codex's plugin system
+expects is confirmed identical to Claude Code's, but nothing locally
+available confirms whether a `PreToolUse` entry in that file is recognized,
+ignored, or handled differently (e.g. without delivering pre-tool context to
+the model the way Claude Code's `additionalContext` does). What's missing to
+finish this: a working `PreToolUse` example (upstream or your own), run
+against a real `codex` session, that proves whether the equivalent of
+`additionalContext` reaches the model before the tool call, or at all. Until
+that's confirmed, don't assume a `PreToolUse` entry in a Codex
+`hooks.json` behaves like this tool's Claude Code integration.
+
+### Pi — not implemented
+
+What was checked: Pi's installed coding-agent package's own bundled docs
+(`docs/extensions.md`) and its extension API type definitions
+(`dist/core/extensions/types.d.ts`). Pi's extension system is not a
+`hooks.json` file the way Claude Code's and (apparently) Codex's are — it's
+a TypeScript extension API, loaded via `--extension` or auto-discovery, with
+its own event names.
+
+That API *does* have a pre-tool event: `tool_call` fires "after
+`tool_execution_start`, before the tool executes," is documented as
+"**Can block**," and its handler can mutate `event.input` in place (typed
+per built-in tool, including `bash`/`edit`/`write` — the same lowercase
+names OpenCode uses). But its return type, `ToolCallEventResult`, is
+`{ block?: boolean; reason?: string }` and nothing else — there is no field
+to inject arbitrary context into what the model sees before the tool runs.
+That's the same limitation OpenCode's `tool.execute.before` has, for the
+same reason: a pre-tool hook here can gate or reshape the call, not narrate
+to the model about it.
+
+Pi also has a post-tool event, `tool_result`, whose handler can return
+`{ content, details, isError }` to modify what the model reads after the
+tool executes — structurally the same capability OpenCode's
+`tool.execute.after` has, which is what `plugin/opencode/precedent.ts` is
+built on. So a Pi adapter in the same "supported, weaker" shape as the
+OpenCode one looks feasible by the same mechanism, in principle — it just
+wasn't built as part of this change, since only the OpenCode adapter was in
+scope. A reader who wants to finish this can model it on
+`plugin/opencode/precedent.ts`: shell out to
+`tripwire.py --match --agent pi`, and append the result from a
+`pi.on("tool_result", ...)` handler using `isToolCallEventType`/
+`isBashToolResult` to read the matched tool's path or command.
+
+### Any MCP agent — out of scope, on purpose
+
+An MCP server is not offered, deliberately, for two reasons:
+
+1. **It would add tools and always-on tokens.** Every MCP tool this server
+   exposed would sit in every agent's tool list on every turn, whether or
+   not a pattern ever matched — the opposite of the "harness-only, ~0
+   tokens" cost this tool is built around (see
+   [What it does](README.md#what-it-does)).
+2. **It would turn surfacing into a *pull* the agent has to remember to
+   perform.** An MCP tool only fires when the model decides to call it.
+   That's exactly the failure class this tool exists to prevent: a lesson
+   that exists somewhere but isn't read before the work that would repeat
+   it (see [The problem](README.md#the-problem)). A hook is a *push* — it
+   runs whether or not the model thought to ask — and that's the entire
+   reason this is a hook and not an MCP server.
 
 ## `tools/mine.py`
 
